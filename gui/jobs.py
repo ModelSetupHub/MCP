@@ -432,7 +432,7 @@ class Job:
 
         Only downloads have this: a transfer can be suspended and picked up again
         from its partial data, which is a different thing from cancelling — the
-        task and its queue stay intact. Benchmarks and installers have no
+        task and its queue stay intact. Benchmarks have no
         equivalent, so they never register one and the panel offers no pause
         button for them.
 
@@ -681,7 +681,7 @@ class DuplicateJob(RuntimeError):
     """Raised when an operation that is already tracked is started again.
 
     The registry allows one live job per key, so a second attempt to track the
-    same download session — or the same installation — is refused rather than
+    same download session — or the same benchmark — is refused rather than
     given a job of its own. Two jobs for one operation would each offer their own
     Cancel button over the same work, and cancelling one would leave the other
     reporting progress for something that had been cleaned up.

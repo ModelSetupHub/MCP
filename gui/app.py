@@ -7,9 +7,9 @@ tool was called from, in a sandboxed iframe.
 
 Two kinds of tool live here:
 
-- The long-running operations, each bound to the panel. They delegate to
-  ``gui.tracking``, which runs the unmodified core function and publishes
-  progress alongside it.
+- The long-running operations that expose measurable progress — downloads and
+  benchmarks — each bound to the panel. They delegate to ``gui.tracking``, which
+  runs the unmodified core function and publishes progress alongside it.
 - ``progress_get_status``, which the panel polls. It is marked
   ``visibility=["app"]`` so it serves the panel without cluttering the model's
   tool list.
@@ -28,9 +28,6 @@ from typing import Any, TypeVar
 from mcp.server.apps import Apps
 from mcp.server.mcpserver.exceptions import MCPServerError, ToolError
 from mcp.types import ToolAnnotations
-
-from core.ollama import runtime
-from core.python import installer, tools as python_tools
 
 from . import tracking
 from .jobs import DuplicateJob, registry
@@ -99,8 +96,8 @@ def create_progress_app(
         name="progress-panel",
         title="Operation progress",
         description=(
-            "Live progress for downloads, installations and benchmarks, "
-            "rendered inline in the conversation."
+            "Live progress for downloads and benchmarks, rendered inline in the "
+            "conversation."
         ),
         prefers_border=False,
     )
@@ -109,7 +106,6 @@ def create_progress_app(
     register_control_tools(apps)
     register_download_tools(apps, get_session, release_session)
     register_benchmark_tools(apps)
-    register_install_tools(apps)
 
     return apps
 
@@ -210,9 +206,9 @@ def register_control_tools(apps: Apps) -> None:
     """Register the panel's Cancel and Stop buttons.
 
     The two are deliberately different operations. Cancel ends the task and has
-    core undo it, and applies to all three long-running operations. Stop only
-    suspends a download and leaves the task intact, so it exists for downloads
-    alone — they are the only operation core can pause and resume.
+    core undo it, and applies to both tracked operations. Stop only suspends a
+    download and leaves the task intact, so it exists for downloads alone — they
+    are the only operation core can pause and resume.
 
     Args:
         apps: Extension the tools are added to.
@@ -224,11 +220,10 @@ def register_control_tools(apps: Apps) -> None:
         title="Cancel a running operation",
         description=(
             "Cancel a tracked operation and undo what it had done so far. The "
-            "download, benchmark or installation stops at its next safe point, "
-            "core removes everything the operation created — partial and "
-            "completed downloads, a half-finished installation, packages the run "
-            "added, a loaded model — and records a cancelled entry in the "
-            "execution log, which is the only trace left behind. The operation is "
+            "download or benchmark stops at its next safe point, core removes "
+            "everything the operation created — partial and completed downloads, "
+            "a loaded model — and records a cancelled entry in the execution log, "
+            "which is the only trace left behind. The operation is "
             "then removed completely: its progress bar, its job and, for a "
             "download, the session itself, so starting the same work again means "
             "creating it fresh and produces exactly one new task. Cannot be "
@@ -281,7 +276,7 @@ def register_control_tools(apps: Apps) -> None:
             "was stopped. The queue, the files already fetched and the partial "
             "data are all kept, and resuming continues the active file from where "
             "it left off via an HTTP range request. Downloads only: benchmarks "
-            "and installations cannot be suspended, and calling this for one "
+            "cannot be suspended, and calling this for one "
             "reports that it is unavailable rather than cancelling it. With no "
             "id, targets the most recently started operation. The progress "
             "panel's Stop button calls this."
@@ -544,215 +539,3 @@ def register_benchmark_tools(apps: Apps) -> None:
             ) from duplicate
 
         return {"progress_id": job.progress_id, "result": result}
-
-
-def _track_steps_once(
-    title: str,
-    subtitle: str | None,
-    key: str,
-    steps: list[tuple[str, Callable[[Any], Any]]],
-) -> tuple[list[Any], Any]:
-    """Run a stepped operation, refusing to track the same one twice.
-
-    Two bars over one installation would each offer a Cancel that rolls the whole
-    thing back, so the second attempt is rejected instead of racing the first.
-
-    Args:
-        title: Headline shown on the panel.
-        subtitle: Optional secondary line.
-        key: Identity of the operation, for example the installer path.
-        steps: ``(step name, callable taking the token)`` pairs, run in order.
-
-    Returns:
-        tuple[list[Any], Any]: Each callable's return value, and the job.
-
-    Raises:
-        ToolError: If a live job is already tracking this operation.
-    """
-    try:
-        return tracking.track_steps(
-            title=title,
-            subtitle=subtitle,
-            steps=steps,
-            key=key,
-        )
-    except DuplicateJob as duplicate:
-        raise ToolError(
-            f"This operation is already running and tracked as "
-            f"{duplicate.job.progress_id}. Poll that progress bar, or cancel it "
-            f"before starting again."
-        ) from duplicate
-
-
-def register_install_tools(apps: Apps) -> None:
-    """Register the installation tools that show the panel.
-
-    An installer reports nothing measurable while it runs, so these jobs stay
-    indeterminate: the panel shows which step is active and that the server is
-    still alive, which is the whole reason a bar is wanted here.
-
-    Args:
-        apps: Extension the tools are added to.
-    """
-
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
-        name="ollama_install_with_progress",
-        title="Install Ollama with a progress bar",
-        description=(
-            "Run a local Ollama installer and show a live progress bar in the "
-            "conversation while it runs, then start the service and report its "
-            "status. Takes the path to an installer already on disk; it does not "
-            "download anything, and the installer may prompt interactively. The "
-            "bar is indeterminate because the installer reports no percentage."
-        ),
-        annotations=ToolAnnotations(
-            read_only_hint=False,
-            destructive_hint=False,
-            idempotent_hint=False,
-            open_world_hint=False,
-        ),
-    )
-    @surface_core_errors
-    def ollama_install_with_progress(installer_path: str) -> dict:
-        """Install Ollama and start it, with progress.
-
-        Args:
-            installer_path: Path to the installer executable on disk.
-
-        Returns:
-            dict: Runtime status afterwards, plus the ``progress_id``.
-
-        Raises:
-            ToolError: If this installer is already running under another
-                progress bar.
-        """
-        _, job = _track_steps_once(
-            title="Installing Ollama",
-            subtitle=installer_path,
-            key=f"ollama-install:{installer_path}",
-            steps=[
-                (
-                    "Run installer",
-                    lambda token: runtime.install(
-                        installer_path=installer_path,
-                        cancellation=token,
-                    ),
-                ),
-                ("Start service", lambda token: runtime.start()),
-            ],
-        )
-
-        return {"progress_id": job.progress_id, "status": runtime.get_status()}
-
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
-        name="python_install_python_with_progress",
-        title="Install Python with a progress bar",
-        description=(
-            "Run a local Windows Python installer in quiet mode with PATH "
-            "prepending and show a live progress bar in the conversation while "
-            "it runs. The installer must already be on disk; nothing is "
-            "downloaded. Modifies system state outside this project and may "
-            "require elevation for an all-users install. Returns the detected "
-            "Python installations afterwards."
-        ),
-        annotations=ToolAnnotations(
-            read_only_hint=False,
-            destructive_hint=False,
-            idempotent_hint=False,
-            open_world_hint=False,
-        ),
-    )
-    @surface_core_errors
-    def python_install_python_with_progress(
-        installer_path: str,
-        all_users: bool = False,
-    ) -> dict:
-        """Install Python from a local installer, with progress.
-
-        Args:
-            installer_path: Path to the installer executable.
-            all_users: Whether to install for all users instead of the current one.
-
-        Returns:
-            dict: Detected Python versions afterwards, plus the ``progress_id``.
-
-        Raises:
-            ToolError: If this installer is already running under another
-                progress bar.
-        """
-        results, job = _track_steps_once(
-            title="Installing Python",
-            subtitle=installer_path,
-            key=f"python-install:{installer_path}",
-            steps=[
-                (
-                    "Run installer",
-                    lambda token: installer.install_python(
-                        installer_path=installer_path,
-                        all_users=all_users,
-                        cancellation=token,
-                    ),
-                ),
-            ],
-        )
-
-        return {"progress_id": job.progress_id, "result": results[0]}
-
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
-        name="python_install_packages_with_progress",
-        title="Install packages with a progress bar",
-        description=(
-            "Install packages with pip into a virtual environment — or into the "
-            "interpreter running this server when none is given — showing a live "
-            "progress bar in the conversation with one row per package. Accepts "
-            "version specifiers such as 'numpy==1.26.4' and downloads from the "
-            "configured package index."
-        ),
-        annotations=LONG_RUNNING,
-    )
-    @surface_core_errors
-    def python_install_packages_with_progress(
-        packages: list[str],
-        env_path: str | None = None,
-    ) -> dict:
-        """Install packages with pip, with progress.
-
-        Each package is installed by its own pip call so the panel can close one
-        row at a time; pip resolves dependencies per call either way.
-
-        Args:
-            packages: Package names or version specifiers.
-            env_path: Optional target virtual environment.
-
-        Returns:
-            dict: Per-package pip output, plus the ``progress_id``.
-
-        Raises:
-            ToolError: If the same packages are already being installed into the
-                same environment under another progress bar.
-        """
-        outputs, job = _track_steps_once(
-            title=f"Installing {len(packages)} package(s)",
-            subtitle=env_path or "server interpreter",
-            key=f"pip-install:{env_path or ''}:{','.join(sorted(packages))}",
-            steps=[
-                (
-                    package,
-                    lambda token, package=package: python_tools.install_packages(
-                        packages=[package],
-                        environment=env_path,
-                        cancellation=token,
-                    ),
-                )
-                for package in packages
-            ],
-        )
-
-        return {
-            "progress_id": job.progress_id,
-            "result": dict(zip(packages, outputs)),
-        }
-

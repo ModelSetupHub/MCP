@@ -88,18 +88,18 @@ Suggested order of operations:
 - Core logs every significant operation; logs_read surfaces detail that a
   tool's return value may not include, especially after a failure.
 
-Anything slow — downloads, installers, benchmarks — has a '_with_progress'
-variant that renders a live progress bar in the conversation, with a Cancel
-button. Prefer those variants; they return the same data as the plain tool, plus
-a progress_id. Clients that cannot render the panel still get the return value.
+Downloads and benchmarks have a '_with_progress' variant that renders a live
+progress bar in the conversation, with a Cancel button. Prefer those variants;
+they return the same data as the plain tool, plus a progress_id. Clients that
+cannot render the panel still get the return value. Installations have no
+progress variant — call the plain tools for those.
 
 Two different controls act on a running operation:
 
 - progress_cancel ends the task and has core undo it — partial and completed
-  downloads are deleted, a half-finished installation is uninstalled, packages
-  the run added are removed, a loaded model is unloaded — leaving only a
+  downloads are deleted, a loaded model is unloaded — leaving only a
   'cancelled' entry in the execution log, which logs_read will show. It applies
-  to downloads, benchmarks and installations alike, and cannot be undone.
+  to downloads and benchmarks alike, and cannot be undone.
 - progress_pause stops a download without cancelling it: the queue and the bytes
   already fetched are kept, and calling it again resumes from where it left off.
   Downloads only.
@@ -109,8 +109,8 @@ download that includes the session itself: its id becomes free, and downloading
 the same files again means calling download_create_session and download_add
 again. Do not try to restart or add to a cancelled session — it will refuse.
 
-One operation is tracked by one progress bar. Starting a download, installation or
-benchmark that is already running is rejected rather than started twice; poll the
+One operation is tracked by one progress bar. Starting a download or benchmark
+that is already running is rejected rather than started twice; poll the
 progress bar named in the error, or cancel it first.
 
 Tools that delete models, environments, script files, or queued downloads are

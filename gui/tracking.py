@@ -13,22 +13,20 @@ progress from whatever the operation already exposes:
   watcher's last read routinely misses it. When the call returns, its watcher is
   stopped and joined and every step row is closed from the returned result, which
   is what stops a finished configuration from being left reading "waiting".
-- Installers report nothing measurable while they work, so their jobs stay
-  indeterminate and only track which step is active.
 
 Every wrapper also gives its job the controls the panel offers. Cancelling uses
-a ``CancellationToken`` for the benchmarks and installers, and the manager's own
-``cancel`` for downloads; when it lands, core raises ``OperationCancelled`` after
+a ``CancellationToken`` for the benchmarks and the manager's own ``cancel`` for
+downloads; when it lands, core raises ``OperationCancelled`` after
 undoing the operation's side effects, and the wrapper turns that into
 ``Job.finish_cancelled`` — which drops the job, leaving core's log entry as the
 only trace. Downloads additionally expose ``pause``/``resume``, which suspend the
 transfer without touching the queue, so the panel can offer Stop alongside Cancel
 for them.
 
-Each job is keyed on the operation it tracks — the download session id, the
-installer path — so one operation can never be tracked by two jobs at once. That
-is what stops a second start from appearing beside the first with its own Cancel
-button over the same work.
+Each job is keyed on the operation it tracks — the download session id, the model
+and label being benchmarked — so one operation can never be tracked by two jobs
+at once. That is what stops a second start from appearing beside the first with
+its own Cancel button over the same work.
 
 Nothing here reaches into core's internals: it calls the same public functions
 the plain tools call, and reads the status and log surfaces core already writes.
@@ -918,75 +916,6 @@ def _summarise(result: dict) -> str:
         parts.append(f"{duration:.1f}s per prompt")
 
     return " · ".join(parts) if parts else "Finished with no successful prompt."
-
-
-def track_steps(
-    title: str,
-    subtitle: str | None,
-    steps: list[tuple[str, Callable[[CancellationToken], Any]]],
-    key: str | None = None,
-) -> tuple[list[Any], Job]:
-    """Run a sequence of core calls as one cancellable job with a step each.
-
-    For operations that report nothing measurable while they work — an installer
-    running silently, pip resolving a package — the value of the panel is showing
-    which step is active, that the server has not stalled, and offering a way out.
-    Those steps stay indeterminate and are closed as each call returns.
-
-    Each callable receives the job's cancellation token and must pass it to the
-    core function it calls, so a cancellation reaches the work rather than only
-    taking effect between steps.
-
-    Args:
-        title: Headline shown on the panel.
-        subtitle: Optional secondary line.
-        steps: ``(step name, callable taking the token)`` pairs, run in order.
-        key: Optional identity of the operation, so the same installation cannot
-            be tracked by two jobs at once.
-
-    Returns:
-        tuple[list[Any], Job]: Each callable's return value, and the job.
-
-    Raises:
-        DuplicateJob: If this operation is already tracked by a live job.
-        OperationCancelled: If the job is cancelled. Core has already undone the
-            interrupted step, and the job is dropped, so nothing survives but
-            core's log entry.
-        Exception: Whatever a step raises. The failing step and the job are both
-            marked failed first, and the remaining steps are not run.
-    """
-    job = registry.create(title=title, subtitle=subtitle, key=key)
-    job.add_steps([name for name, _ in steps])
-
-    token = CancellationToken()
-    job.set_canceller(token.cancel)
-
-    results = []
-
-    for index, (_, call) in enumerate(steps):
-        # A cancellation that landed between two steps has nothing running to
-        # interrupt, so it is caught here instead of starting the next step.
-        if token.cancelled:
-            job.finish_cancelled(token.reason or "Cancelled by request")
-            raise OperationCancelled(token.reason or "Cancelled by request")
-
-        job.start_step(index, detail="running")
-
-        try:
-            results.append(call(token))
-        except OperationCancelled as error:
-            job.finish_cancelled(str(error))
-            raise
-        except Exception as error:
-            job.finish_step(index, state=FAILED, detail="failed", note=str(error))
-            job.finish(state=FAILED, subtitle=str(error))
-            raise
-
-        job.finish_step(index, detail="done")
-
-    job.finish(state=COMPLETED, subtitle="Finished.")
-
-    return results, job
 
 
 def cancel_job(job: Job) -> dict:
