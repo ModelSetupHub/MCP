@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ModelSetupHub progress</title>
+    <!--
+      progress.css and progress.js are separate files on disk; gui/loader.py
+      inlines them here at import time. A ui:// resource is delivered as one
+      HTML document, so the panel cannot fetch sibling files at runtime.
+    -->
+    <style>/* INJECT:CSS */</style>
+  </head>
+  <body>
+    <main class="panel" role="region" aria-label="Operation progress">
+      <div class="head">
+        <div class="head-text">
+          <h1 class="title" id="title">Starting…</h1>
+          <p class="subtitle hidden" id="subtitle"></p>
+        </div>
+        <div class="head-actions">
+          <button type="button" class="btn pause hidden" id="pause">Stop</button>
+          <button type="button" class="btn cancel hidden" id="cancel">Cancel</button>
+          <span class="badge" id="badge" data-state="running">running</span>
+        </div>
+      </div>
+
+      <div
+        class="bar"
+        id="bar"
+        role="progressbar"
+        aria-labelledby="title"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        data-state="running"
+        data-indeterminate="true"
+      >
+        <div class="bar-fill" id="bar-fill"></div>
+      </div>
+
+      <div class="metrics hidden" id="metrics"></div>
+
+      <ul class="steps hidden" id="steps"></ul>
+
+      <pre class="log hidden" id="log" aria-live="polite"></pre>
+
+      <div class="foot">
+        <span id="elapsed"></span>
+        <span id="eta"></span>
+      </div>
+    </main>
+
+    <script>
+      /* INJECT:JS */
+    </script>
+  </body>
+</html>

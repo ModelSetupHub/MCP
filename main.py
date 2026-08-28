@@ -47,14 +47,22 @@ if not (CORE_ROOT / "core" / "__init__.py").is_file():
 if str(CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(CORE_ROOT))
 
-from Core.core import logging as core_logging  # noqa: E402
-from Core.core.system import hardware, scanner  # noqa: E402
-from Core.core.download_manager.manager import (  # noqa: E402
+# Core is imported the same way it imports itself — as the top-level `core`
+# package — because `Core.core.x` and `core.x` are two distinct module objects
+# holding two distinct copies of every class. Mixing the spellings means an
+# exception raised inside core does not match the class this layer caught it with.
+from core import logging as core_logging  # noqa: E402
+from core.system import hardware, scanner  # noqa: E402
+from core.download_manager.manager import (  # noqa: E402
     ALLOWED_DOMAINS,
     DownloadManager,
 )
-from Core.core.ollama import experiment, model, runtime  # noqa: E402
-from Core.core.python import environment, installer, tools  # noqa: E402
+from core.ollama import experiment, model, runtime  # noqa: E402
+from core.python import environment, installer, tools  # noqa: E402
+
+# The in-chat progress panel and the tools bound to it. Every frontend file lives
+# under gui/; this layer only hands it a way to resolve a download session.
+from gui import create_progress_app  # noqa: E402
 
 SERVER_NAME = "modelsetuphub"
 SERVER_TITLE = "ModelSetupHub"
@@ -79,6 +87,22 @@ Suggested order of operations:
   download_list_allowed_domains are accepted.
 - Core logs every significant operation; logs_read surfaces detail that a
   tool's return value may not include, especially after a failure.
+
+Anything slow — downloads, installers, benchmarks — has a '_with_progress'
+variant that renders a live progress bar in the conversation, with a Cancel
+button. Prefer those variants; they return the same data as the plain tool, plus
+a progress_id. Clients that cannot render the panel still get the return value.
+
+Two different controls act on a running operation:
+
+- progress_cancel ends the task and has core undo it — partial and completed
+  downloads are deleted, a half-finished installation is uninstalled, packages
+  the run added are removed, a loaded model is unloaded — leaving only a
+  'cancelled' entry in the execution log, which logs_read will show. It applies
+  to downloads, benchmarks and installations alike, and cannot be undone.
+- progress_pause stops a download without cancelling it: the queue and the bytes
+  already fetched are kept, and calling it again resumes from where it left off.
+  Downloads only.
 
 Tools that delete models, environments, script files, or queued downloads are
 irreversible and are annotated as destructive. Confirm the target before
@@ -1337,9 +1361,14 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_cancel",
         title="Cancel all downloads",
         description=(
-            "Stop the active download and abandon the rest of the queue. "
-            "Completed files are kept; the interrupted file stays as partial "
-            "data. The session cannot be restarted afterwards."
+            "Stop the active download, abandon the rest of the queue, and delete "
+            "the files this session produced — both partial data and files that "
+            "had already completed, since the queue is one unit of work that did "
+            "not finish. Files that existed before the session started are kept. "
+            "The stop is recorded in the execution log; the session cannot be "
+            "restarted afterwards. Cancelling a queue that already finished does "
+            "nothing and deletes nothing. Pass keep_files to abandon the queue "
+            "without deleting anything."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1349,17 +1378,21 @@ def register_download_tools(server: MCPServer) -> None:
         ),
     )
     @surface_core_errors
-    def download_cancel(session_id: str) -> dict:
+    def download_cancel(
+        session_id: str,
+        keep_files: bool = False,
+    ) -> dict:
         """Cancel a session's remaining downloads.
 
         Args:
             session_id: Target session.
+            keep_files: Keep what the session downloaded instead of deleting it.
 
         Returns:
             dict: Session status after requesting cancellation.
         """
         manager = _get_session(session_id)
-        manager.cancel()
+        manager.cancel(cleanup=not keep_files)
         return manager.get_status()
 
     @server.tool(
@@ -1368,7 +1401,8 @@ def register_download_tools(server: MCPServer) -> None:
         description=(
             "Drop a session from the registry, cancelling it first if it is "
             "still running. Downloaded files are left on disk; only the "
-            "in-memory queue and its progress history are discarded."
+            "in-memory queue and its progress history are discarded. Use "
+            "download_cancel to stop a session and delete what it produced."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1388,7 +1422,9 @@ def register_download_tools(server: MCPServer) -> None:
             dict: Final status of the closed session.
         """
         manager = _get_session(session_id)
-        manager.cancel()
+        # Closing a session is bookkeeping, not a request to undo the download,
+        # so the files it produced are left alone.
+        manager.cancel(cleanup=False)
         status = manager.get_status()
 
         with _sessions_lock:
@@ -1488,6 +1524,11 @@ def create_server() -> MCPServer:
         title=SERVER_TITLE,
         instructions=INSTRUCTIONS,
         version=SERVER_VERSION,
+        # The progress panel is an additive MCP Apps extension: it contributes the
+        # ui:// resource and the tools bound to it, and intercepts nothing. The
+        # session resolver is passed in so the download registry above stays the
+        # single place sessions live.
+        extensions=[create_progress_app(get_session=_get_session)],
     )
 
     for register in REGISTRARS:
