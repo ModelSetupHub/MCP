@@ -21,6 +21,10 @@
   // fast, to pick the job up the moment it appears rather than sitting on a stale
   // "starting" frame for most of a second; the interval relaxes once real
   // progress is arriving and there is nothing to catch up to.
+  //
+  // Those first polls carry no id, and the server answers them by handing over the
+  // newest *running* job no other panel has claimed — never simply the newest,
+  // which during this window is the previous operation in the conversation.
   var FIRST_POLL_INTERVAL_MS = 150;
   var POLL_INTERVAL_MS = 600;
 
@@ -30,6 +34,9 @@
   var nextId = 1;
   var hostCapabilities = {};
   var pinnedJobId = null;
+  // Whether the pin came from this panel's own tool call, rather than from
+  // claiming whichever job was unclaimed when polling began.
+  var pinnedAuthoritatively = false;
   var pollTimer = null;
   var pollInterval = FIRST_POLL_INTERVAL_MS;
   var polling = false;
@@ -148,25 +155,125 @@
   }
 
   function applyToolInput(args) {
-    // A caller may pin the panel to one job explicitly; otherwise the server
-    // reports whichever job is newest, and the first snapshot pins it.
+    // An explicit progress_id is authoritative: the caller named the job it wants
+    // this panel to show.
     if (typeof args.progress_id === "string" && args.progress_id) {
-      pinnedJobId = args.progress_id;
+      pinTo(args.progress_id, true);
+      return;
     }
-    if (typeof args.session_id === "string" && args.session_id && !pinnedJobId) {
-      dom.subtitle.textContent = "session " + args.session_id;
+    if (
+      typeof args.session_id === "string" &&
+      args.session_id &&
+      !pinnedJobId &&
+      dom.subtitle
+    ) {
+      setText(dom.subtitle, "session " + args.session_id);
     }
   }
 
   function applyToolResult(result) {
+    // The result of the tool this panel belongs to carries that tool's own job
+    // id, which is the one thing that identifies this panel's operation beyond
+    // doubt. It arrives after polling has already started, so it is also the
+    // correction for a panel that adopted the wrong job in the meantime.
+    //
+    // It is read from the envelope rather than through structuredOf: these tools
+    // return {progress_id, result|status}, and structuredOf unwraps to the inner
+    // payload, which does not carry the id.
+    //
+    // A host that re-renders a stored panel replays this notification, so the id
+    // may name an operation that ended long ago. That is handled rather than
+    // guarded against: the poll it triggers finds nothing on the server and the
+    // panel says the operation has ended, instead of falling back to whatever is
+    // running now.
+    var envelope = result && result.structuredContent;
+    if (
+      envelope &&
+      typeof envelope.progress_id === "string" &&
+      envelope.progress_id
+    ) {
+      pinTo(envelope.progress_id, true);
+    }
+
     // The tool returning does not always mean the work is over: a download tool
     // hands back a queue status and lets the transfer continue on a background
     // thread. So this only forces a refresh — polling stops when a snapshot
     // reports a terminal state, or when the host tears the panel down.
+    if (finished) {
+      // A replayed result for an operation already reported as over: refreshing
+      // would only ask the server again for something it has forgotten.
+      return;
+    }
+
     poll();
 
     if (result && result.isError && lastSnapshot === null) {
       renderError(textOf(result));
+    }
+  }
+
+  // Bind the panel to one job. `authoritative` marks an id that came from this
+  // panel's own tool call rather than from claiming whatever was unclaimed, and
+  // is allowed to correct an earlier guess; when it does, everything drawn for
+  // the wrong job is cleared, so no part of another task's state survives.
+  function pinTo(progressId, authoritative) {
+    if (pinnedJobId === progressId) {
+      if (authoritative) {
+        pinnedAuthoritatively = true;
+      }
+      return;
+    }
+
+    if (pinnedAuthoritatively && !authoritative) {
+      return;
+    }
+
+    var replacing = pinnedJobId !== null;
+
+    pinnedJobId = progressId;
+    pinnedAuthoritatively = Boolean(authoritative);
+
+    if (replacing) {
+      resetView();
+    }
+  }
+
+  // Return the panel to its opening frame. Used when a pin is corrected: the
+  // rows, metrics, badge and buttons on screen describe a different operation,
+  // and leaving any of them would show one task's state under another's title.
+  function resetView() {
+    lastSnapshot = null;
+    finished = false;
+    cancelling = false;
+    pausePending = false;
+
+    // A host notification can arrive before the document is ready, in which case
+    // there is nothing drawn to clear and the flags above are all that matter.
+    if (!dom.title) {
+      return;
+    }
+
+    dom.title.textContent = "Starting…";
+    setText(dom.subtitle, null);
+
+    dom.badge.dataset.state = "running";
+    dom.badge.textContent = "running";
+
+    dom.bar.dataset.state = "running";
+    dom.bar.dataset.indeterminate = "true";
+    dom.barFill.style.width = "0%";
+
+    dom.cancel.classList.add("hidden");
+    dom.cancel.disabled = false;
+    dom.cancel.textContent = "Cancel";
+    dom.pause.classList.add("hidden");
+    dom.pause.disabled = false;
+
+    renderMetrics({});
+    renderSteps([]);
+
+    if (hostCapabilities.serverTools) {
+      startPolling();
     }
   }
 
@@ -220,17 +327,50 @@
           return;
         }
 
-        // Nothing is tracked yet: the tool call that opened this panel has not
-        // reached core. Keep the "starting" frame and keep polling fast — showing
-        // the server's "Nothing to report" placeholder here would be wrong, since
-        // there is something to report, it just does not exist yet.
+        // Nothing is tracked. Which of two very different situations this is
+        // depends on whether the panel knows its own job yet.
         if (snapshot.tracked === false) {
-          if (lastSnapshot !== null) {
+          if (lastSnapshot !== null || cancelling) {
             // The job was there and is now gone: it was cancelled and purged.
+            // Cancelling counts too — a cancellation that lands before the first
+            // snapshot arrives still purges the job, and polling on would sit on
+            // the placeholder forever.
+            finished = true;
             stopPolling();
+            if (lastSnapshot === null) {
+              renderCancelled("Cancelled; everything it created was removed.");
+            }
+          } else if (pinnedAuthoritatively) {
+            // This panel names its job and the server does not have it: the
+            // conversation was reopened after the operation ended, or the server
+            // has restarted since. Say so and stop. Showing whatever is running
+            // now instead is exactly the leak this guards against.
+            finished = true;
+            stopPolling();
+            renderUnavailable();
           }
+          // Otherwise the tool call has not reached the server yet. Keep the
+          // "starting" frame and keep polling fast; the placeholder would be
+          // wrong here, since there is something to report, it just does not
+          // exist yet.
           return;
         }
+
+        // The first snapshot of an unpinned poll is the job the server handed
+        // this panel, and no other panel will be given it. Pinning here is what
+        // keeps every later poll on that same job even as newer ones start.
+        //
+        // But an unpinned poll is a guess until this panel's own tool result
+        // confirms it, and one guess is never acceptable: a snapshot that is
+        // already finished cannot belong to a panel that has only just opened, so
+        // it is ignored rather than drawn. That is the rule that stops a panel in
+        // any chat from adopting a previous task's results, however the server
+        // came to offer them.
+        if (!pinnedAuthoritatively && lastSnapshot === null && TERMINAL[snapshot.state]) {
+          return;
+        }
+
+        pinTo(snapshot.progress_id, false);
 
         // A job exists, so there is no longer a gap to close.
         if (pollInterval !== POLL_INTERVAL_MS && !TERMINAL[snapshot.state]) {
@@ -338,11 +478,18 @@
   /* ---------------------------------------------------------------- rendering */
 
   function render(snapshot) {
-    lastSnapshot = snapshot;
-
-    if (!pinnedJobId && typeof snapshot.progress_id === "string") {
-      pinnedJobId = snapshot.progress_id;
+    // A snapshot for a job this panel is not showing is dropped rather than
+    // drawn: a poll already in flight when the pin was corrected would otherwise
+    // paint the old operation over the new one.
+    if (
+      pinnedJobId &&
+      typeof snapshot.progress_id === "string" &&
+      snapshot.progress_id !== pinnedJobId
+    ) {
+      return;
     }
+
+    lastSnapshot = snapshot;
 
     var state = snapshot.state || "running";
 
@@ -379,15 +526,6 @@
 
     renderMetrics(snapshot);
     renderSteps(snapshot.steps || []);
-    renderLog(snapshot.log || []);
-
-    dom.elapsed.textContent = snapshot.elapsed_seconds
-      ? "elapsed " + formatDuration(snapshot.elapsed_seconds)
-      : "";
-    dom.eta.textContent =
-      state === "running" && snapshot.eta_seconds
-        ? "about " + formatDuration(snapshot.eta_seconds) + " left"
-        : "";
 
     if (TERMINAL[state]) {
       finished = true;
@@ -502,12 +640,6 @@
     dom.steps.classList.toggle("hidden", items.length === 0);
   }
 
-  function renderLog(lines) {
-    dom.log.textContent = lines.join("\n");
-    dom.log.classList.toggle("hidden", lines.length === 0);
-    dom.log.scrollTop = dom.log.scrollHeight;
-  }
-
   function renderError(message) {
     dom.badge.dataset.state = "failed";
     dom.badge.textContent = "failed";
@@ -529,6 +661,28 @@
     setText(dom.subtitle, reason || "Cancelled.");
   }
 
+  // The panel's own operation is not on the server: the conversation was reopened
+  // after it ended, or the server has restarted. The bar is emptied rather than
+  // filled in from whatever else is running, because the honest thing to show is
+  // that this record is no longer live.
+  function renderUnavailable() {
+    dom.title.textContent = "Progress no longer available";
+    dom.badge.dataset.state = "completed";
+    dom.badge.textContent = "ended";
+    dom.bar.dataset.state = "completed";
+    dom.bar.dataset.indeterminate = "false";
+    dom.barFill.style.width = "0%";
+    dom.cancel.classList.add("hidden");
+    dom.pause.classList.add("hidden");
+    renderMetrics({});
+    renderSteps([]);
+    setText(
+      dom.subtitle,
+      "This operation has ended. Its outcome is in the conversation, and " +
+        "logs_read has the full record."
+    );
+  }
+
   /* ---------------------------------------------------------------- utilities */
 
   function setText(element, value) {
@@ -541,21 +695,6 @@
       return 0;
     }
     return Math.max(0, Math.min(100, Number(percent)));
-  }
-
-  function formatDuration(seconds) {
-    var total = Math.max(0, Math.round(Number(seconds) || 0));
-    var hours = Math.floor(total / 3600);
-    var minutes = Math.floor((total % 3600) / 60);
-    var rest = total % 60;
-
-    if (hours) {
-      return hours + "h " + minutes + "m";
-    }
-    if (minutes) {
-      return minutes + "m " + rest + "s";
-    }
-    return rest + "s";
   }
 
   function reportSize() {
@@ -576,9 +715,6 @@
       barFill: document.getElementById("bar-fill"),
       metrics: document.getElementById("metrics"),
       steps: document.getElementById("steps"),
-      log: document.getElementById("log"),
-      elapsed: document.getElementById("elapsed"),
-      eta: document.getElementById("eta"),
     };
 
     dom.cancel.addEventListener("click", requestCancel);

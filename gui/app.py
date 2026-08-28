@@ -33,7 +33,7 @@ from core.ollama import runtime
 from core.python import installer, tools as python_tools
 
 from . import tracking
-from .jobs import registry
+from .jobs import DuplicateJob, registry
 from .loader import load_progress_app_html
 
 PROGRESS_URI = "ui://modelsetuphub/progress.html"
@@ -74,13 +74,19 @@ def surface_core_errors(function: CallableT) -> CallableT:
     return wrapper  # type: ignore[return-value]
 
 
-def create_progress_app(get_session: Callable[[str], Any]) -> Apps:
+def create_progress_app(
+    get_session: Callable[[str], Any],
+    release_session: Callable[[str], Any] | None = None,
+) -> Apps:
     """Build the Apps extension carrying the panel and its tools.
 
     Args:
         get_session: Resolver for a download session id, supplied by the layer
             that owns the session registry — ``main.py`` — so this module does
             not duplicate that state.
+        release_session: Called with a session id once its queue has stopped, so
+            the owning layer can drop a cancelled session. Downloads that
+            completed normally are left registered.
 
     Returns:
         Apps: Extension to pass as ``MCPServer(extensions=[...])``.
@@ -101,7 +107,7 @@ def create_progress_app(get_session: Callable[[str], Any]) -> Apps:
 
     register_status_tool(apps)
     register_control_tools(apps)
-    register_download_tools(apps, get_session)
+    register_download_tools(apps, get_session, release_session)
     register_benchmark_tools(apps)
     register_install_tools(apps)
 
@@ -122,9 +128,11 @@ def register_status_tool(apps: Apps) -> None:
         title="Get operation progress",
         description=(
             "Report a tracked operation's progress: state, overall percentage, "
-            "per-step rows, metrics and recent log lines. With no id, reports "
-            "the most recently started operation. The progress panel polls this "
-            "while an operation runs; it is not normally called directly."
+            "per-step rows and metrics. With no id, claims the newest operation "
+            "no progress bar has adopted yet — which is how a freshly opened "
+            "panel finds the operation it was opened for. The progress panel "
+            "polls this while an operation runs; it is not normally called "
+            "directly."
         ),
         annotations=ToolAnnotations(
             read_only_hint=True,
@@ -137,14 +145,28 @@ def register_status_tool(apps: Apps) -> None:
     def progress_get_status(progress_id: str | None = None) -> dict:
         """Return one operation's progress snapshot.
 
+        A panel is rendered as soon as its tool call is issued, before the server
+        has created the job, so its first polls arrive without an id. Those are
+        answered by ``claim_unclaimed``, which hands over a job only when it is
+        running, unclaimed and seconds old — never simply the newest, which during
+        that window is the previous operation's and would leave the new panel
+        showing a task that had already finished.
+
+        An id from an earlier run of this server, or naming a job that has since
+        expired, resolves to nothing rather than to whatever is current.
+
         Args:
-            progress_id: Identifier reported by a tracked tool; omit for the
-                newest operation.
+            progress_id: Identifier reported by a tracked tool; omit to claim the
+                caller's own operation.
 
         Returns:
             dict: Progress snapshot, or a placeholder when nothing is tracked.
         """
-        job = registry.get(progress_id) if progress_id else registry.latest()
+        job = (
+            registry.get(progress_id)
+            if progress_id
+            else registry.claim_unclaimed()
+        )
 
         if job is None:
             return _untracked(progress_id)
@@ -180,9 +202,7 @@ def _untracked(progress_id: str | None) -> dict:
         "cancelling": False,
         "steps": [],
         "metrics": [],
-        "log": [],
         "elapsed_seconds": 0.0,
-        "eta_seconds": None,
     }
 
 
@@ -208,7 +228,10 @@ def register_control_tools(apps: Apps) -> None:
             "core removes everything the operation created — partial and "
             "completed downloads, a half-finished installation, packages the run "
             "added, a loaded model — and records a cancelled entry in the "
-            "execution log, which is the only trace left behind. Cannot be "
+            "execution log, which is the only trace left behind. The operation is "
+            "then removed completely: its progress bar, its job and, for a "
+            "download, the session itself, so starting the same work again means "
+            "creating it fresh and produces exactly one new task. Cannot be "
             "undone; to suspend a download and keep it, use progress_pause "
             "instead. With no id, cancels the most recently started operation. "
             "The progress panel's Cancel button calls this."
@@ -226,13 +249,17 @@ def register_control_tools(apps: Apps) -> None:
 
         Args:
             progress_id: Identifier reported by a tracked tool; omit for the
-                newest operation.
+                newest operation that is still running.
 
         Returns:
             dict: Final progress snapshot after the cleanup, with
             ``cancel_requested`` false when the operation had already finished.
         """
-        job = registry.get(progress_id) if progress_id else registry.latest()
+        job = (
+            registry.get(progress_id)
+            if progress_id
+            else registry.latest_active()
+        )
 
         if job is None:
             snapshot = _untracked(progress_id)
@@ -272,13 +299,17 @@ def register_control_tools(apps: Apps) -> None:
 
         Args:
             progress_id: Identifier reported by a tracked tool; omit for the
-                newest operation.
+                newest operation that is still running.
 
         Returns:
             dict: Progress snapshot afterwards, with ``pause_action`` set to
             ``paused``, ``resumed`` or ``unavailable``.
         """
-        job = registry.get(progress_id) if progress_id else registry.latest()
+        job = (
+            registry.get(progress_id)
+            if progress_id
+            else registry.latest_active()
+        )
 
         if job is None:
             snapshot = _untracked(progress_id)
@@ -295,12 +326,14 @@ def register_control_tools(apps: Apps) -> None:
 def register_download_tools(
     apps: Apps,
     get_session: Callable[[str], Any],
+    release_session: Callable[[str], Any] | None = None,
 ) -> None:
     """Register the download start tool that shows the panel.
 
     Args:
         apps: Extension the tool is added to.
         get_session: Resolver for a download session id.
+        release_session: Called with the session id once its queue has stopped.
     """
 
     @apps.tool(
@@ -309,11 +342,13 @@ def register_download_tools(
         title="Start downloading with a progress bar",
         description=(
             "Start processing a session's queue and show a live progress bar in "
-            "the conversation: per-file bars with transferred and total bytes, "
-            "an overall percentage and an ETA. Returns immediately, like "
+            "the conversation: per-file bars with transferred and total bytes and "
+            "an overall percentage. Returns immediately, like "
             "download_start; the panel keeps updating while the background "
             "thread works. Queue every file first, and prefer this over "
-            "download_start whenever a human is watching."
+            "download_start whenever a human is watching. Calling it again for a "
+            "session that is already downloading is rejected rather than starting "
+            "a second transfer of the same files."
         ),
         annotations=LONG_RUNNING,
     )
@@ -327,14 +362,71 @@ def register_download_tools(
         Returns:
             dict: Session status just after starting, plus the ``progress_id``
             the panel polls.
+
+        Raises:
+            ToolError: If this session is already downloading under another
+                progress bar.
         """
         manager = get_session(session_id)
-        job = tracking.track_download(manager, session_id=session_id)
+
+        try:
+            job = tracking.track_download(
+                manager,
+                session_id=session_id,
+                on_finished=_release_when_cancelled(
+                    session_id, manager, release_session
+                ),
+            )
+        except DuplicateJob as duplicate:
+            # A second bar over one queue would offer two Cancel buttons for the
+            # same work, and the first to be pressed would delete the files the
+            # other was still reporting progress for.
+            raise ToolError(
+                f"Download session '{session_id}' is already being downloaded "
+                f"and tracked as {duplicate.job.progress_id}. Poll that "
+                f"progress bar, or cancel it before starting again."
+            ) from duplicate
 
         return {
             "progress_id": job.progress_id,
             "status": manager.get_status(),
         }
+
+
+def _release_when_cancelled(
+    session_id: str,
+    manager: Any,
+    release_session: Callable[[str], Any] | None,
+) -> Callable[[str], None] | None:
+    """Build the watcher's completion hook for one download session.
+
+    A cancelled session is closed: its queue is gone and the files it fetched
+    have been deleted, so it is dropped from the owning registry and its id
+    becomes free again. A session that finished normally is left registered —
+    its status is still worth reading, and nothing about it is stale.
+
+    Args:
+        session_id: Session the hook belongs to.
+        manager: Manager being watched.
+        release_session: Remover supplied by the owning layer, if any.
+
+    Returns:
+        Callable[[str], None] | None: Hook for ``track_download``, or None when
+        no remover was supplied.
+    """
+    if release_session is None:
+        return None
+
+    def on_finished(finished_id: str) -> None:
+        try:
+            closed = manager.get_status()["closed"]
+        except Exception:  # pragma: no cover - defensive
+            closed = True
+
+        if closed:
+            release_session(finished_id)
+
+    return on_finished
 
 
 def register_benchmark_tools(apps: Apps) -> None:
@@ -377,14 +469,25 @@ def register_benchmark_tools(apps: Apps) -> None:
 
         Returns:
             dict: Per-prompt results and summary, plus the ``progress_id``.
+
+        Raises:
+            ToolError: If the same model and label are already being benchmarked
+                under another progress bar.
         """
-        result, job = tracking.run_test_tracked(
-            model=model_name,
-            prompts=prompts,
-            config=config,
-            name=name,
-            include_output=include_output,
-        )
+        try:
+            result, job = tracking.run_test_tracked(
+                model=model_name,
+                prompts=prompts,
+                config=config,
+                name=name,
+                include_output=include_output,
+            )
+        except DuplicateJob as duplicate:
+            raise ToolError(
+                f"'{model_name}' is already being benchmarked under the label "
+                f"'{name}', tracked as {duplicate.job.progress_id}. Use a "
+                f"different name, or cancel that run first."
+            ) from duplicate
 
         return {"progress_id": job.progress_id, "result": result}
 
@@ -421,15 +524,64 @@ def register_benchmark_tools(apps: Apps) -> None:
         Returns:
             dict: One benchmark result per configuration, plus the
             ``progress_id``.
+
+        Raises:
+            ToolError: If this model is already being compared under another
+                progress bar.
         """
-        result, job = tracking.compare_tests_tracked(
-            model=model_name,
-            prompts=prompts,
-            configurations=configurations,
-            include_output=include_output,
-        )
+        try:
+            result, job = tracking.compare_tests_tracked(
+                model=model_name,
+                prompts=prompts,
+                configurations=configurations,
+                include_output=include_output,
+            )
+        except DuplicateJob as duplicate:
+            raise ToolError(
+                f"'{model_name}' is already being compared, tracked as "
+                f"{duplicate.job.progress_id}. Wait for that run or cancel it "
+                f"before starting another."
+            ) from duplicate
 
         return {"progress_id": job.progress_id, "result": result}
+
+
+def _track_steps_once(
+    title: str,
+    subtitle: str | None,
+    key: str,
+    steps: list[tuple[str, Callable[[Any], Any]]],
+) -> tuple[list[Any], Any]:
+    """Run a stepped operation, refusing to track the same one twice.
+
+    Two bars over one installation would each offer a Cancel that rolls the whole
+    thing back, so the second attempt is rejected instead of racing the first.
+
+    Args:
+        title: Headline shown on the panel.
+        subtitle: Optional secondary line.
+        key: Identity of the operation, for example the installer path.
+        steps: ``(step name, callable taking the token)`` pairs, run in order.
+
+    Returns:
+        tuple[list[Any], Any]: Each callable's return value, and the job.
+
+    Raises:
+        ToolError: If a live job is already tracking this operation.
+    """
+    try:
+        return tracking.track_steps(
+            title=title,
+            subtitle=subtitle,
+            steps=steps,
+            key=key,
+        )
+    except DuplicateJob as duplicate:
+        raise ToolError(
+            f"This operation is already running and tracked as "
+            f"{duplicate.job.progress_id}. Poll that progress bar, or cancel it "
+            f"before starting again."
+        ) from duplicate
 
 
 def register_install_tools(apps: Apps) -> None:
@@ -470,10 +622,15 @@ def register_install_tools(apps: Apps) -> None:
 
         Returns:
             dict: Runtime status afterwards, plus the ``progress_id``.
+
+        Raises:
+            ToolError: If this installer is already running under another
+                progress bar.
         """
-        _, job = tracking.track_steps(
+        _, job = _track_steps_once(
             title="Installing Ollama",
             subtitle=installer_path,
+            key=f"ollama-install:{installer_path}",
             steps=[
                 (
                     "Run installer",
@@ -520,10 +677,15 @@ def register_install_tools(apps: Apps) -> None:
 
         Returns:
             dict: Detected Python versions afterwards, plus the ``progress_id``.
+
+        Raises:
+            ToolError: If this installer is already running under another
+                progress bar.
         """
-        results, job = tracking.track_steps(
+        results, job = _track_steps_once(
             title="Installing Python",
             subtitle=installer_path,
+            key=f"python-install:{installer_path}",
             steps=[
                 (
                     "Run installer",
@@ -567,10 +729,15 @@ def register_install_tools(apps: Apps) -> None:
 
         Returns:
             dict: Per-package pip output, plus the ``progress_id``.
+
+        Raises:
+            ToolError: If the same packages are already being installed into the
+                same environment under another progress bar.
         """
-        outputs, job = tracking.track_steps(
+        outputs, job = _track_steps_once(
             title=f"Installing {len(packages)} package(s)",
             subtitle=env_path or "server interpreter",
+            key=f"pip-install:{env_path or ''}:{','.join(sorted(packages))}",
             steps=[
                 (
                     package,

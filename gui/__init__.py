@@ -27,5 +27,6 @@ if str(_CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CORE_ROOT))
 
 from .app import PROGRESS_URI, create_progress_app  # noqa: E402
+from .tracking import note_download_ended  # noqa: E402
 
-__all__ = ["PROGRESS_URI", "create_progress_app"]
+__all__ = ["PROGRESS_URI", "create_progress_app", "note_download_ended"]

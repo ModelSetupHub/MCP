@@ -8,6 +8,11 @@ progress from whatever the operation already exposes:
   and the watcher keeps the job current until the transfer ends.
 - Benchmarks return only when every prompt has run, but core logs each prompt as
   it completes, so a watcher tails the execution log for per-prompt progress.
+  That log is a best-effort source of *live* progress, not the authority on the
+  outcome: core writes a prompt's entry immediately before returning, so the
+  watcher's last read routinely misses it. When the call returns, its watcher is
+  stopped and joined and every step row is closed from the returned result, which
+  is what stops a finished configuration from being left reading "waiting".
 - Installers report nothing measurable while they work, so their jobs stay
   indeterminate and only track which step is active.
 
@@ -19,6 +24,11 @@ undoing the operation's side effects, and the wrapper turns that into
 only trace. Downloads additionally expose ``pause``/``resume``, which suspend the
 transfer without touching the queue, so the panel can offer Stop alongside Cancel
 for them.
+
+Each job is keyed on the operation it tracks — the download session id, the
+installer path — so one operation can never be tracked by two jobs at once. That
+is what stops a second start from appearing beside the first with its own Cancel
+button over the same work.
 
 Nothing here reaches into core's internals: it calls the same public functions
 the plain tools call, and reads the status and log surfaces core already writes.
@@ -48,6 +58,7 @@ from .jobs import (
     PAUSED,
     RUNNING,
     SKIPPED,
+    DuplicateJob,
     Job,
     registry,
 )
@@ -57,6 +68,15 @@ POLL_SECONDS = 0.4
 
 # How long a cancellation waits for core's cleanup before reporting back.
 CANCEL_TIMEOUT = 60.0
+
+# How long the download watcher waits for the worker thread to exit after a
+# cancellation, before it publishes the final snapshot.
+WORKER_STOP_TIMEOUT = 30.0
+
+# How long a benchmark waits for its log watcher to drain before closing the job.
+# The watcher sleeps between reads, so core can write the last prompt's entry
+# after the call has returned but before the watcher has read it.
+WATCHER_DRAIN_TIMEOUT = 5.0
 
 # States DownloadManager reports per queue item, mapped onto step states.
 DOWNLOAD_STEP_STATES = {
@@ -72,14 +92,21 @@ DOWNLOAD_STEP_STATES = {
 }
 
 
-def _spawn(target: Callable[[], None], name: str) -> None:
+def _spawn(target: Callable[[], None], name: str) -> threading.Thread:
     """Run a watcher on a daemon thread.
 
     Args:
         target: Zero-argument callable to run.
         name: Thread name, for debugging.
+
+    Returns:
+        threading.Thread: The running thread, so a caller can wait for it to
+        finish draining before closing the job it writes to.
     """
-    threading.Thread(target=target, name=name, daemon=True).start()
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    thread.start()
+
+    return thread
 
 
 def format_bytes(count: float | None) -> str:
@@ -108,6 +135,7 @@ def format_bytes(count: float | None) -> str:
 def track_download(
     manager: DownloadManager,
     session_id: str,
+    on_finished: Callable[[str], None] | None = None,
 ) -> Job:
     """Start a session's queue and follow it on a watcher thread.
 
@@ -115,16 +143,25 @@ def track_download(
     the tool call that triggered this does not block for the length of the
     transfer. The watcher polls the manager's own status until the queue stops.
 
+    The job is keyed on the session, so a session that is already being tracked
+    cannot pick up a second job and a second Cancel button over the same queue.
+
     Args:
         manager: Session manager to start.
-        session_id: Session identifier, shown on the panel.
+        session_id: Session identifier, shown on the panel and used as the job's
+            key.
+        on_finished: Called with the session id once the queue has stopped and
+            any cancellation cleanup has run, so the caller can drop the session
+            from whatever registry holds it.
 
     Returns:
         Job: The job the panel polls.
 
     Raises:
+        DuplicateJob: If this session is already tracked by a live job.
         Exception: Whatever ``DownloadManager.start`` raises, for example when
-            the queue is empty. The job is marked failed first.
+            the queue is empty or the session has been cancelled. The job is
+            marked failed first.
     """
     status = manager.get_status()
     filenames = [item["filename"] for item in status["downloads"]]
@@ -132,6 +169,7 @@ def track_download(
     job = registry.create(
         title=f"Downloading {len(filenames)} file(s)",
         subtitle=f"session {session_id}",
+        key=_download_key(session_id),
     )
     job.add_steps(filenames)
     # DownloadManager owns both controls already: cancel() removes the files the
@@ -143,19 +181,80 @@ def track_download(
     try:
         manager.start()
     except Exception as error:
-        job.log(str(error))
         job.finish(state=FAILED, subtitle=str(error))
         raise
 
     _spawn(
-        lambda: _watch_download(job, manager),
+        lambda: _watch_download(
+            job=job,
+            manager=manager,
+            session_id=session_id,
+            on_finished=on_finished,
+        ),
         name=f"progress-download-{session_id}",
     )
 
     return job
 
 
-def _watch_download(job: Job, manager: DownloadManager) -> None:
+def _download_key(session_id: str) -> str:
+    """Build the job key identifying one download session.
+
+    Args:
+        session_id: Session identifier.
+
+    Returns:
+        str: Key namespaced so it cannot collide with another operation's.
+    """
+    return f"download:{session_id}"
+
+
+def find_download_job(session_id: str) -> Job | None:
+    """Return the live job tracking a download session, if there is one.
+
+    Args:
+        session_id: Session identifier.
+
+    Returns:
+        Job | None: The job, or None when the session is not being tracked.
+    """
+    return registry.find(_download_key(session_id))
+
+
+def note_download_ended(session_id: str, reason: str) -> bool:
+    """Tell a session's progress bar that the session was ended elsewhere.
+
+    A download can be stopped by the plain ``download_cancel`` tool rather than
+    the panel's button. The job's watcher would notice on its next poll anyway,
+    but until then the panel keeps offering Cancel and Stop for a queue that has
+    already gone. Marking the job here closes that window, and waiting for it to
+    finish means the session's identity is genuinely free by the time the tool
+    returns — so creating it again immediately cannot collide with the old bar.
+
+    Args:
+        session_id: Session that was ended.
+        reason: Why it was ended, shown on the panel.
+
+    Returns:
+        bool: True when a live job was tracking the session.
+    """
+    job = find_download_job(session_id)
+
+    if job is None:
+        return False
+
+    job.request_cancel(reason=reason)
+    job.wait_until_finished(CANCEL_TIMEOUT)
+
+    return True
+
+
+def _watch_download(
+    job: Job,
+    manager: DownloadManager,
+    session_id: str,
+    on_finished: Callable[[str], None] | None = None,
+) -> None:
     """Mirror a download session's status onto a job until it stops.
 
     ``DownloadManager.start`` marks the session running before it returns, so a
@@ -165,46 +264,70 @@ def _watch_download(job: Job, manager: DownloadManager) -> None:
     Args:
         job: Job to update.
         manager: Session being watched.
+        session_id: Session identifier, passed to ``on_finished``.
+        on_finished: Called once the queue has stopped and any cleanup has run.
     """
-    while True:
-        status = manager.get_status()
-        _apply_download_status(job, status)
+    try:
+        while True:
+            status = manager.get_status()
+            _apply_download_status(job, status)
 
-        if not status["running"]:
-            break
+            if not status["running"]:
+                break
 
-        time.sleep(POLL_SECONDS)
+            time.sleep(POLL_SECONDS)
 
-    final = manager.get_status()
-    _apply_download_status(job, final)
+        # A cancellation returns before the worker has exited, and core's cleanup
+        # runs on that thread. Waiting for it means the snapshot below describes
+        # the state after the files were removed, not during.
+        manager.wait_until_stopped(timeout=WORKER_STOP_TIMEOUT)
 
-    states = {item["status"] for item in final["downloads"]}
+        final = manager.get_status()
+        _apply_download_status(job, final)
 
-    if final["cancelled"]:
-        # cancel() removes every file the session produced, including the ones
-        # that had finished, so a row still reading "completed" would be pointing
-        # at something no longer on disk.
-        for index, item in enumerate(final["downloads"]):
-            if item["status"] == "completed":
-                job.finish_step(index, state=CANCELLED, detail="removed")
+        states = {item["status"] for item in final["downloads"]}
 
-        # The cancellation is already logged and the files are gone, so dropping
-        # the job leaves nothing about the download behind.
-        job.finish_cancelled(
-            final.get("cancel_reason") or "Cancelled; downloaded files removed."
-        )
-    elif "failed" in states:
-        failed = [
-            item["filename"]
-            for item in final["downloads"]
-            if item["status"] == "failed"
-        ]
-        job.finish(
-            state=FAILED,
-            subtitle=f"Failed: {', '.join(failed)}",
-        )
-    else:
-        job.finish(state=COMPLETED, subtitle="All files downloaded.")
+        if final["cancelled"]:
+            deleted = final.get("files_deleted", True)
+
+            if deleted:
+                # cancel() removes every file the session produced, including the
+                # ones that had finished, so a row still reading "completed"
+                # would be pointing at something no longer on disk.
+                for index, item in enumerate(final["downloads"]):
+                    if item["status"] == "completed":
+                        job.finish_step(index, state=CANCELLED, detail="removed")
+
+            # The cancellation is already logged and the files are gone, so
+            # dropping the job leaves nothing about the download behind.
+            job.finish_cancelled(
+                final.get("cancel_reason")
+                or (
+                    "Cancelled; downloaded files removed."
+                    if deleted
+                    else "Cancelled; downloaded files kept."
+                )
+            )
+        elif "failed" in states:
+            failed = [
+                item["filename"]
+                for item in final["downloads"]
+                if item["status"] == "failed"
+            ]
+            job.finish(
+                state=FAILED,
+                subtitle=f"Failed: {', '.join(failed)}",
+            )
+        else:
+            job.finish(state=COMPLETED, subtitle="All files downloaded.")
+    except Exception as error:  # pragma: no cover - defensive
+        # The watcher owns the job's terminal state, so it must reach one even if
+        # reading the manager fails; otherwise the panel polls a running job
+        # forever and the session is never released.
+        job.finish(state=FAILED, subtitle=f"Progress tracking failed: {error}")
+    finally:
+        if on_finished is not None:
+            on_finished(session_id)
 
 
 def _apply_download_status(job: Job, status: dict) -> None:
@@ -289,6 +412,11 @@ def run_test_tracked(
     advanced from the execution log: core writes an entry per prompt, and a
     watcher thread tails it while the benchmark is in flight.
 
+    The job is keyed on the model and label, which is also what the watcher
+    filters core's log entries by. Two runs sharing both would therefore each
+    advance on the other's prompts, and cancelling one would unload the model the
+    other was still using, so the second is refused.
+
     Args:
         model: Model name or tag to benchmark.
         prompts: Prompts to run, in order.
@@ -300,13 +428,16 @@ def run_test_tracked(
         tuple[dict, Job]: Core's benchmark result and the job the panel polled.
 
     Raises:
+        DuplicateJob: If the same model and label are already being benchmarked.
         Exception: Whatever ``experiment.run_test`` raises. The job is marked
             failed first.
     """
     job = registry.create(
         title=f"Benchmarking {model}",
         subtitle=f"{len(prompts)} prompt(s) · {name}",
+        key=f"benchmark:{model}:{name}",
     )
+
     job.add_steps([f"prompt {index}" for index in range(1, len(prompts) + 1)])
 
     token = CancellationToken()
@@ -314,7 +445,7 @@ def run_test_tracked(
 
     tail = LogTail(core_logging.get_execution_log_path())
     stop = threading.Event()
-    _spawn(
+    watcher = _spawn(
         lambda: _watch_test(job=job, tail=tail, stop=stop, name=name),
         name="progress-benchmark",
     )
@@ -329,18 +460,27 @@ def run_test_tracked(
             cancellation=token,
         )
     except OperationCancelled as error:
+        # The watcher is stopped before the job is closed, so it cannot apply a
+        # late log entry to a job that has already been removed.
         stop.set()
+        watcher.join(timeout=WATCHER_DRAIN_TIMEOUT)
         # Core has unloaded the model, discarded the partial results and logged
         # the cancellation; dropping the job removes the last trace.
         job.finish_cancelled(str(error))
         raise
     except Exception as error:
         stop.set()
+        watcher.join(timeout=WATCHER_DRAIN_TIMEOUT)
         job.finish(state=FAILED, subtitle=str(error))
         raise
-    finally:
-        stop.set()
 
+    # Core writes the last prompt's entry just before returning, which can be
+    # after the watcher's final read. Waiting for it to drain is what stops the
+    # closing snapshot from showing the last row still running.
+    stop.set()
+    watcher.join(timeout=WATCHER_DRAIN_TIMEOUT)
+
+    _close_open_steps(job, result=result)
     job.finish(state=COMPLETED, subtitle=_summarise(result))
 
     return result, job
@@ -369,12 +509,14 @@ def compare_tests_tracked(
         tuple[dict, Job]: Core's comparison result and the job the panel polled.
 
     Raises:
+        DuplicateJob: If the same model is already being compared.
         Exception: Whatever ``experiment.compare_tests`` raises. The job is
             marked failed first.
     """
     job = registry.create(
         title=f"Comparing {len(configurations)} configuration(s)",
         subtitle=f"{model} · {len(prompts)} prompt(s) each",
+        key=f"compare:{model}",
     )
 
     token = CancellationToken()
@@ -382,7 +524,7 @@ def compare_tests_tracked(
 
     tail = LogTail(core_logging.get_execution_log_path())
     stop = threading.Event()
-    _spawn(
+    watcher = _spawn(
         lambda: _watch_comparison(
             job=job,
             tail=tail,
@@ -403,18 +545,183 @@ def compare_tests_tracked(
         )
     except OperationCancelled as error:
         stop.set()
+        watcher.join(timeout=WATCHER_DRAIN_TIMEOUT)
         job.finish_cancelled(str(error))
         raise
     except Exception as error:
         stop.set()
+        watcher.join(timeout=WATCHER_DRAIN_TIMEOUT)
         job.finish(state=FAILED, subtitle=str(error))
         raise
-    finally:
-        stop.set()
 
+    stop.set()
+    watcher.join(timeout=WATCHER_DRAIN_TIMEOUT)
+
+    _close_comparison_steps(job, result=result)
     job.finish(state=COMPLETED, subtitle="Comparison complete.")
 
     return result, job
+
+
+def _close_open_steps(job: Job, result: dict) -> None:
+    """Close a finished benchmark's step rows from its own results.
+
+    The rows are advanced from core's execution log while the run is in flight,
+    which is the only progress a benchmark exposes mid-run. But the log is a
+    best-effort source: an entry can be written after the watcher's last read, and
+    a prompt that failed before core got as far as logging it produces no entry at
+    all. Either way a row would be left reading "waiting" under a completed job.
+
+    The returned result is authoritative — it has one entry per prompt, in order —
+    so it settles every row once the run is over.
+
+    Args:
+        job: Job whose steps are being closed.
+        result: Return value of ``experiment.run_test``.
+    """
+    results = result.get("results") or []
+
+    for offset, entry in enumerate(results):
+        job.finish_step(
+            offset,
+            state=FAILED if entry.get("success") is False else COMPLETED,
+            detail=_prompt_detail(entry),
+            note=entry.get("error"),
+        )
+
+    # More rows than results means the run stopped early without raising, which
+    # only a failure can do; leaving them "waiting" would suggest they are still
+    # to come.
+    for offset in range(len(results), _step_count(job)):
+        job.finish_step(offset, state=SKIPPED, detail="not run")
+
+
+def _close_comparison_steps(job: Job, result: dict) -> None:
+    """Close a finished comparison's step rows from its own results.
+
+    One row per configuration, matched by the name core recorded rather than by
+    position, since the rows were built from core's own normalised list. This is
+    what stops the last configuration from being left on "waiting": its final
+    prompt is logged immediately before ``compare_tests`` returns, so the watcher
+    routinely misses it.
+
+    Args:
+        job: Job whose steps are being closed.
+        result: Return value of ``experiment.compare_tests``.
+    """
+    tests = result.get("tests") or []
+    names = [test.get("name") for test in tests]
+
+    if not _step_count(job) and names:
+        # The watcher builds the rows from the entry core logs at the start, and a
+        # comparison short enough to finish inside one poll interval leaves it no
+        # chance to. The result carries the same names, so the rows are built here
+        # instead of the job finishing with none at all.
+        job.add_steps([name for name in names if name])
+
+    # Nothing stops two configurations sharing a name, so each row is claimed by
+    # one test: matching purely by name would close one row twice and leave its
+    # twin reading "waiting".
+    rows = _row_names(job)
+    claimed: set[int] = set()
+
+    for test in tests:
+        offset = _claim_row(rows, claimed, test.get("name"))
+
+        if offset is None:
+            continue
+
+        results = test.get("results") or []
+        failed = sum(1 for entry in results if entry.get("success") is False)
+
+        job.finish_step(
+            offset,
+            state=FAILED if failed and failed == len(results) else COMPLETED,
+            detail=_comparison_detail(test),
+        )
+
+    # A configuration the comparison never reached — it cannot happen on a clean
+    # return, but a row silently left "waiting" is the failure being reported.
+    for offset in range(len(rows)):
+        if offset not in claimed:
+            job.finish_step(offset, state=SKIPPED, detail="not run")
+
+
+def _row_names(job: Job) -> list[str]:
+    """List a job's step names, in order.
+
+    Args:
+        job: Job to inspect.
+
+    Returns:
+        list[str]: Step names by index.
+    """
+    return [step["name"] for step in job.snapshot()["steps"]]
+
+
+def _claim_row(
+    rows: list[str],
+    claimed: set[int],
+    name: str | None,
+) -> int | None:
+    """Take the first unclaimed row with a given name.
+
+    Args:
+        rows: Step names by index.
+        claimed: Indices already taken; the chosen one is added.
+        name: Configuration name to match.
+
+    Returns:
+        int | None: Row index, or None when no unclaimed row carries that name.
+    """
+    for offset, row in enumerate(rows):
+        if row == name and offset not in claimed:
+            claimed.add(offset)
+            return offset
+
+    return None
+
+
+def _prompt_detail(entry: dict) -> str | None:
+    """Describe one prompt's result for its step row.
+
+    Args:
+        entry: One item from a benchmark result's ``results`` list.
+
+    Returns:
+        str | None: Output rate, or duration when no rate was measured.
+    """
+    rate = entry.get("output_tokens_per_second")
+
+    if isinstance(rate, (int, float)):
+        return f"{rate:.1f} tok/s"
+
+    duration = entry.get("duration_seconds")
+
+    if isinstance(duration, (int, float)):
+        return f"{duration:.1f}s"
+
+    return None
+
+
+def _comparison_detail(test: dict) -> str:
+    """Describe one configuration's result for its step row.
+
+    Args:
+        test: One item from a comparison result's ``tests`` list.
+
+    Returns:
+        str: Prompt count with the averaged output rate when there is one.
+    """
+    results = test.get("results") or []
+    rate = (test.get("summary") or {}).get("average_output_tokens_per_second")
+
+    count = f"{len(results)}/{len(results)}"
+
+    if isinstance(rate, (int, float)):
+        return f"{count} · {rate:.1f} tok/s"
+
+    return count
 
 
 def _watch_test(
@@ -576,11 +883,6 @@ def _apply_prompt_entry(
         if index >= prompt_count:
             job.finish_step(step_offset, detail=f"{index}/{prompt_count}")
 
-    if failed:
-        job.log(f"{name} prompt {index} failed: {details.get('error')}")
-    elif detail:
-        job.log(f"{name} prompt {index}: {detail}")
-
 
 def _step_count(job: Job) -> int:
     """Count a job's steps.
@@ -622,6 +924,7 @@ def track_steps(
     title: str,
     subtitle: str | None,
     steps: list[tuple[str, Callable[[CancellationToken], Any]]],
+    key: str | None = None,
 ) -> tuple[list[Any], Job]:
     """Run a sequence of core calls as one cancellable job with a step each.
 
@@ -638,18 +941,21 @@ def track_steps(
         title: Headline shown on the panel.
         subtitle: Optional secondary line.
         steps: ``(step name, callable taking the token)`` pairs, run in order.
+        key: Optional identity of the operation, so the same installation cannot
+            be tracked by two jobs at once.
 
     Returns:
         tuple[list[Any], Job]: Each callable's return value, and the job.
 
     Raises:
+        DuplicateJob: If this operation is already tracked by a live job.
         OperationCancelled: If the job is cancelled. Core has already undone the
             interrupted step, and the job is dropped, so nothing survives but
             core's log entry.
         Exception: Whatever a step raises. The failing step and the job are both
             marked failed first, and the remaining steps are not run.
     """
-    job = registry.create(title=title, subtitle=subtitle)
+    job = registry.create(title=title, subtitle=subtitle, key=key)
     job.add_steps([name for name, _ in steps])
 
     token = CancellationToken()
@@ -657,7 +963,13 @@ def track_steps(
 
     results = []
 
-    for index, (name, call) in enumerate(steps):
+    for index, (_, call) in enumerate(steps):
+        # A cancellation that landed between two steps has nothing running to
+        # interrupt, so it is caught here instead of starting the next step.
+        if token.cancelled:
+            job.finish_cancelled(token.reason or "Cancelled by request")
+            raise OperationCancelled(token.reason or "Cancelled by request")
+
         job.start_step(index, detail="running")
 
         try:
@@ -671,7 +983,6 @@ def track_steps(
             raise
 
         job.finish_step(index, detail="done")
-        job.log(f"{name}: done")
 
     job.finish(state=COMPLETED, subtitle="Finished.")
 
@@ -686,15 +997,26 @@ def cancel_job(job: Job) -> dict:
 
     Returns:
         dict: Final snapshot, taken after the cleanup so it reflects what
-        actually happened rather than what was requested.
+        actually happened rather than what was requested. ``cleanup_complete``
+        is false when the cleanup was still running when the wait ran out, which
+        is the one case where the caller should not treat the task as fully gone
+        yet.
     """
     requested = job.request_cancel()
 
+    finished = True
+
     if requested:
-        job.wait_until_finished(CANCEL_TIMEOUT)
+        finished = job.wait_until_finished(CANCEL_TIMEOUT)
 
     snapshot = job.snapshot()
     snapshot["cancel_requested"] = requested
+    snapshot["cleanup_complete"] = finished
+
+    if not finished:
+        snapshot["subtitle"] = (
+            "Cancelled; core is still cleaning up. The task will not resume."
+        )
 
     return snapshot
 
@@ -722,5 +1044,3 @@ def pause_job(job: Job) -> dict:
         )
 
     return snapshot
-
-

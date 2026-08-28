@@ -20,7 +20,7 @@
   --msh-raised: #232932;
 
   /* On --msh-card: 14.6:1, 8.1:1, 5.4:1; all three also clear AA on the raised
-     surfaces the steps and log sit on. */
+     surfaces the steps sit on. */
   --msh-text: #f2f5f8;
   --msh-muted: #b9c3d0;
   --msh-faint: #93a0af;
@@ -368,31 +368,6 @@ body {
 
 .step-note[data-level="error"] {
   color: var(--msh-error-text);
-}
-
-.log {
-  margin: 0;
-  padding: 10px 11px;
-  max-height: 132px;
-  overflow-y: auto;
-  border: 1px solid var(--msh-border);
-  border-radius: var(--msh-radius-sm);
-  background: var(--msh-raised);
-  color: var(--msh-muted);
-  font-family: var(--msh-mono);
-  font-size: 11.5px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  color: var(--msh-faint);
-  font-size: 11.5px;
 }
 
 .hidden {

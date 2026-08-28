@@ -62,7 +62,7 @@ from core.python import environment, installer, tools  # noqa: E402
 
 # The in-chat progress panel and the tools bound to it. Every frontend file lives
 # under gui/; this layer only hands it a way to resolve a download session.
-from gui import create_progress_app  # noqa: E402
+from gui import create_progress_app, note_download_ended  # noqa: E402
 
 SERVER_NAME = "modelsetuphub"
 SERVER_TITLE = "ModelSetupHub"
@@ -103,6 +103,15 @@ Two different controls act on a running operation:
 - progress_pause stops a download without cancelling it: the queue and the bytes
   already fetched are kept, and calling it again resumes from where it left off.
   Downloads only.
+
+A cancelled operation is removed completely, not left in a cancelled state. For a
+download that includes the session itself: its id becomes free, and downloading
+the same files again means calling download_create_session and download_add
+again. Do not try to restart or add to a cancelled session — it will refuse.
+
+One operation is tracked by one progress bar. Starting a download, installation or
+benchmark that is already running is rejected rather than started twice; poll the
+progress bar named in the error, or cancel it first.
 
 Tools that delete models, environments, script files, or queued downloads are
 irreversible and are annotated as destructive. Confirm the target before
@@ -1036,17 +1045,27 @@ def register_python_tools(server: MCPServer) -> None:
 # Downloads — core.download_manager
 # ============================================================
 
+# How long a cancellation waits for the download worker to stop before the tool
+# reports back. The worker exits at a chunk boundary, so this only has to cover
+# one chunk read plus core's own cleanup.
+CANCEL_WAIT_SECONDS = 60.0
+
 # DownloadManager is stateful: a queue is built up, started, then controlled and
 # polled while a background thread downloads. MCP tool calls are individually
 # stateless, so named manager instances are kept here and each tool acts on one
 # by session_id. This registry is the only state this layer adds; queueing,
 # retrying, resuming, and progress tracking all stay in core.
+#
+# A cancelled session is dropped from the registry as part of the cancellation,
+# not left behind in a cancelled state: its queue and files are gone, so keeping
+# it would let a later download_add append to a queue that still held the
+# original URLs and start the same transfer twice.
 _sessions: dict[str, DownloadManager] = {}
 _sessions_lock = threading.Lock()
 
 
 def _get_session(session_id: str) -> DownloadManager:
-    """Look up a download session.
+    """Look up a live download session.
 
     Args:
         session_id: Identifier passed to ``download_create_session``.
@@ -1055,7 +1074,8 @@ def _get_session(session_id: str) -> DownloadManager:
         DownloadManager: The registered manager instance.
 
     Raises:
-        ToolError: If no session is registered under that identifier.
+        ToolError: If no session is registered under that identifier, or if the
+            one registered has been cancelled and is only awaiting removal.
     """
     with _sessions_lock:
         manager = _sessions.get(session_id)
@@ -1066,7 +1086,44 @@ def _get_session(session_id: str) -> DownloadManager:
             f"Unknown download session: '{session_id}' (open sessions: {known})"
         )
 
+    if manager.get_status()["closed"]:
+        # Reached only if a cancellation's own removal has not run yet — a
+        # cancelled session is otherwise gone from the registry entirely.
+        _discard_session(session_id)
+        raise ToolError(
+            f"Download session '{session_id}' was cancelled and cannot be "
+            f"reused. Create it again with download_create_session."
+        )
+
     return manager
+
+
+def _discard_session(session_id: str) -> dict | None:
+    """Remove a session from the registry and release what it still holds.
+
+    Called when a session is cancelled or closed, from whichever path noticed:
+    the ``download_cancel`` tool, the progress panel's Cancel button, or
+    ``download_close_session``. Removing the entry is what makes the identifier
+    reusable, and ``purge`` drops the queue and the worker references the
+    manager was still holding.
+
+    Args:
+        session_id: Session to forget.
+
+    Returns:
+        dict | None: The session's final status, or None when it was already
+        gone.
+    """
+    with _sessions_lock:
+        manager = _sessions.pop(session_id, None)
+
+    if manager is None:
+        return None
+
+    status = manager.get_status()
+    manager.purge()
+
+    return status
 
 
 def register_download_tools(server: MCPServer) -> None:
@@ -1365,9 +1422,10 @@ def register_download_tools(server: MCPServer) -> None:
             "the files this session produced — both partial data and files that "
             "had already completed, since the queue is one unit of work that did "
             "not finish. Files that existed before the session started are kept. "
-            "The stop is recorded in the execution log; the session cannot be "
-            "restarted afterwards. Cancelling a queue that already finished does "
-            "nothing and deletes nothing. Pass keep_files to abandon the queue "
+            "The stop is recorded in the execution log, and the session is then "
+            "removed: its id becomes free, and downloading the same files again "
+            "means creating the session again. Cancelling a queue that already "
+            "finished deletes nothing. Pass keep_files to abandon the queue "
             "without deleting anything."
         ),
         annotations=ToolAnnotations(
@@ -1382,27 +1440,47 @@ def register_download_tools(server: MCPServer) -> None:
         session_id: str,
         keep_files: bool = False,
     ) -> dict:
-        """Cancel a session's remaining downloads.
+        """Cancel a session's remaining downloads and remove the session.
 
         Args:
             session_id: Target session.
             keep_files: Keep what the session downloaded instead of deleting it.
 
         Returns:
-            dict: Session status after requesting cancellation.
+            dict: Session status after the cancellation and cleanup.
         """
         manager = _get_session(session_id)
+        # Core is told first, because its first cancellation is the one that
+        # decides whether the files go: notifying the panel's job first would
+        # cancel through the job's own canceller, which always deletes.
         manager.cancel(cleanup=not keep_files)
-        return manager.get_status()
+        # A progress bar over this session would otherwise keep offering Cancel
+        # and Stop for a queue that is being torn down.
+        note_download_ended(
+            session_id,
+            reason=(
+                "Cancelled with download_cancel; downloaded files kept."
+                if keep_files
+                else "Cancelled with download_cancel; downloaded files removed."
+            ),
+        )
+        # The worker stops at a chunk boundary, so the status is only final once
+        # it has actually exited and core's cleanup has run.
+        manager.wait_until_stopped(timeout=CANCEL_WAIT_SECONDS)
+
+        status = _discard_session(session_id) or manager.get_status()
+
+        return status
 
     @server.tool(
         name="download_close_session",
         title="Close a download session",
         description=(
-            "Drop a session from the registry, cancelling it first if it is "
-            "still running. Downloaded files are left on disk; only the "
-            "in-memory queue and its progress history are discarded. Use "
-            "download_cancel to stop a session and delete what it produced."
+            "Drop a session from the registry, stopping it first if it is still "
+            "running. Downloaded files are left on disk; only the in-memory queue "
+            "and its progress history are discarded, and the session id becomes "
+            "free again. Use download_cancel to stop a session and delete what it "
+            "produced."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1423,14 +1501,17 @@ def register_download_tools(server: MCPServer) -> None:
         """
         manager = _get_session(session_id)
         # Closing a session is bookkeeping, not a request to undo the download,
-        # so the files it produced are left alone.
-        manager.cancel(cleanup=False)
-        status = manager.get_status()
+        # so the files it produced are left alone. Core is told before the panel
+        # for the same reason as in download_cancel: the job's own canceller
+        # deletes, and the first cancellation is the one that decides.
+        manager.close()
+        note_download_ended(
+            session_id,
+            reason="Session closed; downloaded files kept.",
+        )
+        manager.wait_until_stopped(timeout=CANCEL_WAIT_SECONDS)
 
-        with _sessions_lock:
-            _sessions.pop(session_id, None)
-
-        return status
+        return _discard_session(session_id) or manager.get_status()
 
 
 # ============================================================
@@ -1526,9 +1607,15 @@ def create_server() -> MCPServer:
         version=SERVER_VERSION,
         # The progress panel is an additive MCP Apps extension: it contributes the
         # ui:// resource and the tools bound to it, and intercepts nothing. The
-        # session resolver is passed in so the download registry above stays the
-        # single place sessions live.
-        extensions=[create_progress_app(get_session=_get_session)],
+        # session resolver and remover are passed in so the download registry
+        # above stays the single place sessions live — including when the panel's
+        # Cancel button is what ended one.
+        extensions=[
+            create_progress_app(
+                get_session=_get_session,
+                release_session=_discard_session,
+            )
+        ],
     )
 
     for register in REGISTRARS:

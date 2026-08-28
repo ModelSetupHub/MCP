@@ -1,9 +1,9 @@
 """Job model and registry backing the progress panel.
 
 A job is one long-running operation, tracked so the panel can be polled while
-the tool call that owns it is still blocked in core. Every job carries a state,
-an optional set of steps, and a short log; the percentage is derived from the
-steps unless a caller sets one directly.
+the tool call that owns it is still blocked in core. Every job carries a state
+and an optional set of steps; the percentage is derived from the steps unless a
+caller sets one directly.
 
 A job that is still running can be controlled from the panel. It holds the
 callables for its operation — core's cancellation token or the download manager's
@@ -14,6 +14,31 @@ itself from the registry, since a cancelled operation is meant to leave nothing
 behind except the entry core wrote to the execution log. Pausing only suspends a
 download, so the job stays exactly where it was.
 
+A job keeps no log of its own. Core already writes an execution log entry for
+everything worth recording, and ``logs_read`` is how that is read back; a second
+transcript on the panel duplicated it in a window too small to be read.
+
+State isolation
+---------------
+
+This server is one process shared by every conversation, and a panel is part of a
+conversation's record — a host that re-renders a stored panel replays the tool
+input and result it was created with. So a job left reachable outlives the chat it
+belongs to, and the panel of another chat can ask for it by id. Three rules keep
+tasks from leaking into each other:
+
+- **A finished job is not retained.** Once an operation ends, the panel showing it
+  has already rendered its final frame from the last snapshot and stopped polling,
+  so nothing needs the server's copy. It is kept only for a short grace period —
+  long enough for an in-flight poll and the tool's own result to land — and then
+  dropped. Nothing stale is left to serve.
+- **Identifiers are unguessable and never reused.** Each carries a namespace minted
+  when this process started, so an id from an earlier run of the server is rejected
+  outright rather than colliding with a current job.
+- **A job belongs to one panel.** An id-less poll — which is all a panel can send
+  before its tool call has returned — is answered with the newest *running* job no
+  other panel has claimed, never simply the newest.
+
 Jobs are mutated from a worker thread and read from whichever thread answers the
 panel's poll, so each job guards its own fields with a lock and hands out plain
 dictionaries — a snapshot is a copy, never a live view.
@@ -21,15 +46,28 @@ dictionaries — a snapshot is a copy, never a live view.
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
-import itertools
 import threading
 import time
 from typing import Any, Callable
+import uuid
 
-MAX_LOG_LINES = 60
+# Backstop only: with finished jobs expiring, a registry this large means
+# something is genuinely running that many operations at once.
 MAX_JOBS = 24
+
+# How long a finished job stays readable. It has to cover the round trip between
+# the operation ending and the panel's last poll — the tool call returning, the
+# result reaching the panel, one more poll landing — and nothing beyond that.
+FINISHED_GRACE_SECONDS = 20.0
+
+# How long after a job is created it can still be adopted by a panel that polled
+# without an identifier. A panel starts polling within a few hundred milliseconds
+# of its tool call being issued, and the job appears a moment later, so a genuine
+# claim happens almost immediately. Past this window a job is either already shown
+# by its own panel or orphaned — and either way it belongs to a conversation that
+# is not the one now asking, so it is never handed over.
+CLAIMABLE_SECONDS = 10.0
 
 RUNNING = "running"
 COMPLETED = "completed"
@@ -42,7 +80,35 @@ CANCELLING = "cancelling"
 
 TERMINAL_STATES = frozenset({COMPLETED, FAILED, CANCELLED})
 
-_counter = itertools.count(1)
+# Minted per process. A progress id from an earlier run of this server carries a
+# different namespace and is refused, so a panel restored from an older
+# conversation cannot be answered with a current job that happens to share a
+# number — which sequential ids made not just possible but likely.
+INSTANCE = uuid.uuid4().hex[:8]
+
+ID_PREFIX = "progress"
+
+
+def new_progress_id() -> str:
+    """Mint an identifier for one job.
+
+    Returns:
+        str: ``progress-<instance>-<random>``, unique across this process's life
+        and unguessable from another conversation.
+    """
+    return f"{ID_PREFIX}-{INSTANCE}-{uuid.uuid4().hex[:12]}"
+
+
+def belongs_to_this_instance(progress_id: str) -> bool:
+    """Report whether an identifier was minted by this process.
+
+    Args:
+        progress_id: Identifier presented by a panel.
+
+    Returns:
+        bool: True when the id carries this process's namespace.
+    """
+    return progress_id.startswith(f"{ID_PREFIX}-{INSTANCE}-")
 
 
 @dataclass
@@ -80,6 +146,7 @@ class Job:
         title: str,
         subtitle: str | None = None,
         on_remove: Callable[[str], None] | None = None,
+        key: str | None = None,
     ) -> None:
         """Create a running job.
 
@@ -89,10 +156,17 @@ class Job:
             subtitle: Optional secondary line, for example a target name.
             on_remove: Called with the identifier once a cancelled job has been
                 cleaned up, so the registry can drop it.
+            key: Optional identity of the underlying operation — a download
+                session id, say. Two jobs never share a key while both are live,
+                which is what stops one operation being tracked twice.
         """
         self.progress_id = progress_id
         self.title = title
         self.subtitle = subtitle
+        self.key = key
+        # Set once a panel has adopted this job, so the next panel to open looks
+        # for its own rather than adopting this one as well.
+        self.claimed = False
 
         self.state = RUNNING
         self.started_at = time.monotonic()
@@ -101,8 +175,10 @@ class Job:
         self._percent: float | None = None
         self._steps: list[Step] = []
         self._metrics: list[dict[str, Any]] = []
-        self._log: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self._lock = threading.Lock()
+        # Set when the job reaches a terminal state, so a waiter is released the
+        # moment the cleanup ends rather than on the next poll tick.
+        self._finished = threading.Event()
 
         self._canceller: Callable[[str], None] | None = None
         self._pause: Callable[[], None] | None = None
@@ -123,6 +199,9 @@ class Job:
             weight: Relative share of the job each step accounts for.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                return
+
             self._steps.extend(
                 Step(name=name, weight=weight) for name in names
             )
@@ -138,6 +217,9 @@ class Job:
                 indeterminate again.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                return
+
             self._percent = percent
 
     def set_metrics(self, metrics: list[dict[str, Any]]) -> None:
@@ -147,16 +229,10 @@ class Job:
             metrics: Entries shaped as ``{"label": "downloaded", "value": "12 MB"}``.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                return
+
             self._metrics = list(metrics)
-
-    def log(self, message: str) -> None:
-        """Append a line to the job's log.
-
-        Args:
-            message: Text to show; the oldest lines are dropped past the cap.
-        """
-        with self._lock:
-            self._log.append(message)
 
     def start_step(self, index: int, detail: str | None = None) -> None:
         """Mark a step as running.
@@ -234,17 +310,42 @@ class Job:
     ) -> None:
         """Mark the whole job as finished.
 
+        A job that has already finished is left alone: the first terminal state
+        wins. Without that, a watcher thread still draining its last reading
+        could overwrite a cancellation with "completed" and leave the panel
+        claiming an operation succeeded after its files were deleted.
+
         Args:
             state: Final job state: ``completed``, ``failed`` or ``cancelled``.
             subtitle: Optional closing line, for example an error summary.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                return
+
             self.state = state
             self.finished_at = time.monotonic()
             if subtitle is not None:
                 self.subtitle = subtitle
             if state == COMPLETED:
                 self._percent = 100.0
+
+            self._release()
+
+        self._finished.set()
+
+    def _release(self) -> None:
+        """Drop the operation's control callables.
+
+        Called with the lock held once the job is finished. Those callables close
+        over the operation — a cancellation token, a download manager — so
+        clearing them is what stops a finished job from keeping it alive, and
+        makes a late cancel or pause a no-op rather than a call into something
+        that has already been cleaned up.
+        """
+        self._canceller = None
+        self._pause = None
+        self._resume = None
 
     # ========================================================
     # Cancelling
@@ -262,8 +363,13 @@ class Job:
             canceller: Callable taking the reason and cancelling the operation.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                # The operation is over: holding its canceller would keep it
+                # reachable and let a late click call into cleaned-up state.
+                return
+
             self._canceller = canceller
-            pending = self._cancel_requested and self.state not in TERMINAL_STATES
+            pending = self._cancel_requested
 
         if pending:
             canceller("Cancelled from the progress panel")
@@ -301,7 +407,6 @@ class Job:
             self.state = CANCELLING
             self.subtitle = "Cancelling…"
             canceller = self._canceller
-            self._log.append("Cancellation requested.")
 
         if canceller is not None:
             canceller(reason)
@@ -336,6 +441,9 @@ class Job:
             resume: Callable continuing it.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                return
+
             self._pause = pause
             self._resume = resume
 
@@ -358,12 +466,10 @@ class Job:
                 action = self._resume
                 self._paused = False
                 outcome = "resumed"
-                self._log.append("Resumed.")
             else:
                 action = self._pause
                 self._paused = True
                 outcome = "paused"
-                self._log.append("Paused.")
 
         if action is not None:
             action()
@@ -388,6 +494,9 @@ class Job:
             paused: Whether the operation reports itself as paused.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                return
+
             self._paused = paused
 
     def finish_cancelled(self, reason: str | None = None) -> None:
@@ -406,19 +515,27 @@ class Job:
             reason: Why the operation was cancelled, shown on the panel.
         """
         with self._lock:
+            if self.state in TERMINAL_STATES:
+                # Already finished — including by an earlier cancellation, which
+                # has already removed the job.
+                return
+
             self.state = CANCELLED
             self.finished_at = time.monotonic()
             self.subtitle = reason or "Cancelled."
-            self._log.append(
-                "Cancelled; everything this operation created was removed."
-            )
 
             for step in self._steps:
-                if step.state in (RUNNING, WAITING):
+                if step.state in (RUNNING, WAITING, PAUSED):
                     step.state = CANCELLED
                     step.detail = "cancelled"
 
+            self._paused = False
+            self._release()
+
             on_remove = self._on_remove
+            self._on_remove = None
+
+        self._finished.set()
 
         if on_remove is not None:
             on_remove(self.progress_id)
@@ -435,14 +552,8 @@ class Job:
         Returns:
             bool: True if the job finished within the timeout.
         """
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            with self._lock:
-                if self.state in TERMINAL_STATES:
-                    return True
-
-            time.sleep(0.1)
+        if self._finished.wait(timeout):
+            return True
 
         with self._lock:
             return self.state in TERMINAL_STATES
@@ -450,12 +561,20 @@ class Job:
     def _step(self, index: int) -> Step | None:
         """Look up a step by index while the lock is held.
 
+        A finished job hands back nothing: its steps describe what a cancellation
+        undid or what a failure stopped at, and a watcher draining its last
+        reading must not move them back to running.
+
         Args:
             index: Zero-based step index.
 
         Returns:
-            Step | None: The step, or None when the index is out of range.
+            Step | None: The step, or None when the index is out of range or the
+            job has already finished.
         """
+        if self.state in TERMINAL_STATES:
+            return None
+
         if 0 <= index < len(self._steps):
             return self._steps[index]
 
@@ -468,11 +587,14 @@ class Job:
     def snapshot(self) -> dict[str, Any]:
         """Build the payload the panel renders.
 
+        ``elapsed_seconds`` is not shown on the panel any more, but it is kept
+        because ``progress_cancel`` hands this snapshot to the model, where how
+        long an operation ran before it was stopped is worth knowing.
+
         Returns:
             dict[str, Any]: Job state, overall percentage, per-step rows, metric
-            chips, recent log lines, elapsed time and an ETA when one can be
-            estimated. ``percent`` is None when progress is not measurable, which
-            is what makes the bar indeterminate.
+            chips and elapsed seconds. ``percent`` is None when progress is not
+            measurable, which is what makes the bar indeterminate.
         """
         with self._lock:
             percent = self._percent
@@ -502,9 +624,7 @@ class Job:
                 "cancelling": self.state == CANCELLING,
                 "steps": [step.as_dict() for step in self._steps],
                 "metrics": list(self._metrics),
-                "log": list(self._log),
                 "elapsed_seconds": round(elapsed, 1),
-                "eta_seconds": _estimate_eta(percent, elapsed, self.state),
             }
 
 
@@ -541,30 +661,6 @@ def _steps_percent(steps: list[Step]) -> float | None:
     return 100.0 * done / total_weight
 
 
-def _estimate_eta(
-    percent: float | None,
-    elapsed: float,
-    state: str,
-) -> float | None:
-    """Estimate the seconds remaining from the completion rate so far.
-
-    Args:
-        percent: Overall completion from 0 to 100.
-        elapsed: Seconds since the job started.
-        state: Current job state.
-
-    Returns:
-        float | None: Estimated seconds remaining, or None when the job is not
-        running or too little has happened to extrapolate from.
-    """
-    if state != RUNNING or percent is None or percent <= 1 or elapsed <= 1:
-        return None
-
-    total = elapsed * 100.0 / percent
-
-    return round(max(0.0, total - elapsed), 1)
-
-
 def _clamp(percent: float | None) -> float | None:
     """Constrain a percentage to the 0-100 range.
 
@@ -581,41 +677,153 @@ def _clamp(percent: float | None) -> float | None:
     return round(min(100.0, max(0.0, float(percent))), 1)
 
 
-class JobRegistry:
-    """Bounded registry of jobs, newest last."""
+class DuplicateJob(RuntimeError):
+    """Raised when an operation that is already tracked is started again.
 
-    def __init__(self, limit: int = MAX_JOBS) -> None:
+    The registry allows one live job per key, so a second attempt to track the
+    same download session — or the same installation — is refused rather than
+    given a job of its own. Two jobs for one operation would each offer their own
+    Cancel button over the same work, and cancelling one would leave the other
+    reporting progress for something that had been cleaned up.
+    """
+
+    def __init__(self, key: str, job: Job) -> None:
+        """Record which job already owns the key.
+
+        Args:
+            key: Operation identity that is already tracked.
+            job: The live job holding it.
+        """
+        super().__init__(
+            f"This operation is already running and tracked as "
+            f"{job.progress_id}. Cancel it or wait for it to finish before "
+            f"starting it again."
+        )
+        self.key = key
+        self.job = job
+
+
+class JobRegistry:
+    """Registry of live jobs, newest last.
+
+    Holds the operations currently running, plus those that finished within the
+    last :data:`FINISHED_GRACE_SECONDS`. Nothing older is kept: a finished job's
+    final state has already reached its panel, so retaining the server's copy only
+    creates something a later conversation can be served by mistake.
+    """
+
+    def __init__(
+        self,
+        limit: int = MAX_JOBS,
+        grace_seconds: float = FINISHED_GRACE_SECONDS,
+        claimable_seconds: float = CLAIMABLE_SECONDS,
+    ) -> None:
         """Create an empty registry.
 
         Args:
-            limit: How many finished jobs to keep before dropping the oldest.
+            limit: Backstop on how many jobs to hold at once.
+            grace_seconds: How long a finished job stays readable.
+            claimable_seconds: How long a new job can be adopted by a panel that
+                polled without an identifier.
         """
         self._limit = limit
+        self._grace = grace_seconds
+        self._claimable = claimable_seconds
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
 
-    def create(self, title: str, subtitle: str | None = None) -> Job:
+    def create(
+        self,
+        title: str,
+        subtitle: str | None = None,
+        key: str | None = None,
+    ) -> Job:
         """Register a new running job.
 
         Args:
             title: Headline shown on the panel.
             subtitle: Optional secondary line.
+            key: Optional identity of the underlying operation. When given, the
+                registry refuses to create a second live job for it.
 
         Returns:
-            Job: The registered job.
-        """
-        job = Job(
-            progress_id=f"progress-{next(_counter)}",
-            title=title,
-            subtitle=subtitle,
-            on_remove=self.remove,
-        )
+            Job: The registered job, with an identifier unique to this process.
 
+        Raises:
+            DuplicateJob: If a live job already holds this key.
+        """
         with self._lock:
+            self._expire()
+
+            if key is not None:
+                existing = self._live_with_key(key)
+                if existing is not None:
+                    raise DuplicateJob(key, existing)
+
+            job = Job(
+                progress_id=new_progress_id(),
+                title=title,
+                subtitle=subtitle,
+                on_remove=self.remove,
+                key=key,
+            )
+
             self._jobs[job.progress_id] = job
             self._evict()
 
         return job
+
+    def _expire(self) -> None:
+        """Drop finished jobs past their grace period.
+
+        Called with the lock held, at the start of every lookup, so a stale job is
+        gone before anything can be answered with it. Running jobs are never
+        touched, however long they take.
+        """
+        cutoff = time.monotonic() - self._grace
+
+        stale = [
+            progress_id
+            for progress_id, job in self._jobs.items()
+            if job.state in TERMINAL_STATES
+            and (job.finished_at is None or job.finished_at <= cutoff)
+        ]
+
+        for progress_id in stale:
+            del self._jobs[progress_id]
+
+    def _live_with_key(self, key: str) -> Job | None:
+        """Find an unfinished job tracking a given operation.
+
+        Called with the lock held.
+
+        Args:
+            key: Operation identity to look for.
+
+        Returns:
+            Job | None: The live job holding the key, or None. A job that has
+            finished does not count: its operation is over, so starting the same
+            one again is a new task rather than a duplicate.
+        """
+        for job in self._jobs.values():
+            if job.key == key and job.state not in TERMINAL_STATES:
+                return job
+
+        return None
+
+    def find(self, key: str) -> Job | None:
+        """Look up the live job tracking an operation.
+
+        Args:
+            key: Operation identity, for example a download session id.
+
+        Returns:
+            Job | None: The live job, or None when the operation is not tracked.
+        """
+        with self._lock:
+            self._expire()
+
+            return self._live_with_key(key)
 
     def remove(self, progress_id: str) -> None:
         """Drop a job from the registry.
@@ -632,41 +840,111 @@ class JobRegistry:
     def get(self, progress_id: str) -> Job | None:
         """Look up a job by identifier.
 
+        An identifier from an earlier run of this server is refused outright: it
+        cannot name anything current, and answering it with a job that happened to
+        match would be exactly the leak this guards against. The job is also marked
+        claimed, so a panel that opens later and asks for "whichever job is mine"
+        will not be handed this one.
+
         Args:
             progress_id: Identifier from ``create``.
 
         Returns:
-            Job | None: The job, or None when it is unknown or already evicted.
+            Job | None: The job, or None when the identifier is unknown, expired,
+            or was not minted by this process.
         """
+        if not belongs_to_this_instance(progress_id):
+            return None
+
         with self._lock:
-            return self._jobs.get(progress_id)
+            self._expire()
 
-    def latest(self) -> Job | None:
-        """Return the most recently created job.
+            job = self._jobs.get(progress_id)
 
-        The panel opens without knowing an identifier — the tool call that shows
-        it is the one that created the job — so an unqualified poll resolves to
-        the newest job.
+            if job is not None:
+                job.claimed = True
+
+            return job
+
+    def claim_unclaimed(self) -> Job | None:
+        """Adopt the job this panel was opened for, if it can be identified.
+
+        A panel is rendered by the host as soon as its tool call is *issued*,
+        before the server has run the tool and created the job, so its first polls
+        arrive with no identifier and something has to decide what they mean.
+
+        Three restrictions make that decision safe. The job must be **running**,
+        because a panel that has only just opened cannot have been opened for an
+        operation already over. It must be **unclaimed**, so two operations
+        starting together do not both land on the first. And it must have been
+        created **within the last few seconds**, because a panel polls within
+        milliseconds of opening — anything older is another conversation's, and a
+        long download from an hour ago must not be adopted by a panel opening now.
 
         Returns:
-            Job | None: Newest job, or None when none has been created yet.
+            Job | None: The claimable job, now claimed, or None — in which case
+            the caller's own job does not exist yet and its panel keeps waiting.
         """
         with self._lock:
+            self._expire()
+
+            cutoff = time.monotonic() - self._claimable
+
             for job in reversed(self._jobs.values()):
+                if job.claimed or job.state in TERMINAL_STATES:
+                    continue
+
+                if job.started_at <= cutoff:
+                    # Older jobs are older still, so nothing beyond this can be
+                    # claimable either.
+                    return None
+
+                job.claimed = True
+
                 return job
 
         return None
 
+    def latest_active(self) -> Job | None:
+        """Return the newest job that has not finished.
+
+        What an unqualified Cancel or Stop means: a finished job has nothing left
+        to act on, so acting on the newest *running* one is both what the caller
+        intended and the only thing that can have an effect.
+
+        Returns:
+            Job | None: Newest unfinished job, or None when nothing is running.
+        """
+        with self._lock:
+            self._expire()
+
+            for job in reversed(self._jobs.values()):
+                if job.state not in TERMINAL_STATES:
+                    return job
+
+        return None
+
     def snapshots(self) -> list[dict[str, Any]]:
-        """Snapshot every known job, oldest first.
+        """Snapshot every job still held, oldest first.
 
         Returns:
             list[dict[str, Any]]: One snapshot per job.
         """
         with self._lock:
+            self._expire()
+
             jobs = list(self._jobs.values())
 
         return [job.snapshot() for job in jobs]
+
+    def clear(self) -> None:
+        """Forget every job.
+
+        For a test that needs a clean registry, and for a caller that wants to
+        drop everything this process was tracking.
+        """
+        with self._lock:
+            self._jobs.clear()
 
     def _evict(self) -> None:
         """Drop the oldest finished jobs once the registry is over its limit.

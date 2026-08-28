@@ -21,6 +21,8 @@ job bookkeeping behind it.
 │       ├── progress.html
 │       ├── progress.css
 │       └── progress.js
+├── tests/
+│   └── test_task_lifecycle.py   # cancellation and task-lifecycle tests
 ├── requirements.txt
 └── Core/              # submodule
     └── core/          # backend logic
@@ -159,8 +161,8 @@ resume, and progress tracking all stay in core.
 | `download_pause` | `DownloadManager.pause` |
 | `download_resume` | `DownloadManager.resume` |
 | `download_skip` | `DownloadManager.skip` |
-| `download_cancel` | `DownloadManager.cancel` |
-| `download_close_session` | `DownloadManager.cancel(cleanup=False)` + registry removal |
+| `download_cancel` | `DownloadManager.cancel` + registry removal |
+| `download_close_session` | `DownloadManager.close` + registry removal |
 
 `download_start` returns immediately; poll `download_get_status` for progress.
 `DownloadManager.wait()` is not exposed, since blocking a tool call for the
@@ -169,6 +171,18 @@ length of a multi-gigabyte download would stall the client.
 `download_cancel` stops the queue and deletes what the session produced — see
 [Cancelling and stopping](#cancelling-and-stopping). `download_close_session` is
 bookkeeping and keeps the files.
+
+Both of them end the session for good, and both remove it from the registry. A
+cancelled `DownloadManager` refuses `add` and `start` with `SessionCancelled`,
+because its queue and its files are gone and there is nothing left to continue
+from. Downloading the same files again therefore means creating the session again,
+under the same id if you like — which is what stops a cancelled queue from being
+re-run alongside a fresh one and downloading everything twice.
+
+Restarting a session that is still open only picks up what has not run:
+`start` leaves completed, skipped and cancelled items alone and retries failed
+ones, so no file is fetched twice. It raises `RuntimeError` when every item has
+already run.
 
 Core rejects any host outside its whitelist, so check
 `download_list_allowed_domains` before queueing a URL.
@@ -226,13 +240,64 @@ works because the SDK dispatches each request on its own task and runs a sync
 tool function on a worker thread, so a status poll is answered while the tool
 call that owns the operation is still blocked inside core.
 
-The host renders the panel as soon as the tool call is *issued*, which is before
-the call has reached core and created its job — so the first polls find nothing
-tracked. `progress_get_status` marks that case with `tracked: false`, and the
-panel holds its "starting" frame and polls every 150 ms until the job appears,
-relaxing to 600 ms once progress is arriving. Rendering the server's placeholder
-during that window is what used to leave "Nothing to report" on screen for the
-first second or so.
+### State isolation: which job a panel shows
+
+This is the part of the design that needed the most care, because two facts about
+the environment work against the obvious implementation. The server is **one
+process shared by every conversation** — there is no per-chat scope to hang state
+on. And a panel is **part of a conversation's record**: a host that re-renders a
+stored one replays the tool input and result it was created with, so an identifier
+can arrive naming an operation that finished long ago, in a chat that is no longer
+open.
+
+On top of that, the host renders a panel as soon as its tool call is *issued* —
+before the call has reached the server and created its job — so the panel's first
+polls carry no identifier at all and something has to decide what they mean.
+
+Answering those with "the newest job" is what leaked. During that opening window
+the newest job is the *previous* task's, so a panel adopted a finished operation,
+drew its final state, and — the state being terminal — stopped polling and never
+saw the job it was opened for. Four rules replace that guess, and each closes a
+different path:
+
+1. **A finished job is not retained.** Once an operation ends, the panel showing it
+   has already drawn its last frame, so the server's copy has no further reader. It
+   is kept for `FINISHED_GRACE_SECONDS` — enough for an in-flight poll and the
+   tool's own result to land — and then dropped. Nothing stale is left to serve.
+2. **Identifiers are unguessable and namespaced per process.** Each is
+   `progress-<instance>-<random>`, the instance minted at startup. An id from an
+   earlier run of the server is refused outright instead of colliding with a
+   current job — which sequential `progress-1` ids made not merely possible but
+   likely across a restart.
+3. **A job is claimable only briefly, and only once.** An id-less poll is answered
+   with a job that is running, unclaimed, *and* seconds old, because a panel polls
+   within milliseconds of opening. A download that was already underway when the
+   panel opened belongs to another conversation and is never handed over. Asking by
+   id claims the job too, so a pinned panel's job is not offered to the next panel.
+4. **The panel refuses a finished job it did not ask for.** Until its own tool
+   result confirms the pin, a snapshot in a terminal state cannot belong to a panel
+   that has only just opened, so it is ignored rather than drawn — a backstop that
+   holds even if the server offers one.
+
+The panel keeps its end of it. Once a snapshot arrives it pins to that
+`progress_id` and names it in every later poll, so it stays on its own job as newer
+ones start. When its tool call returns, the `progress_id` in the result is
+authoritative and overrides an earlier guess; if it names a different job, the bar,
+badge, buttons, metrics and step rows are all cleared before the new one is drawn,
+so no fragment of one task appears under another's title. A snapshot for any other
+job is dropped rather than rendered.
+
+When a stored panel's id names something the server no longer has, the panel says
+so — "Progress no longer available", with an empty bar — rather than falling back
+to whatever is running now. That is the case the reopened-chat leak turned into a
+wrong reading; showing nothing is the honest answer, and the outcome is in the
+conversation and the execution log either way.
+
+`progress_cancel` and `progress_pause` called without an id act on the newest
+operation still *running*, which is what the model means by "cancel the download"
+and the only thing that can still have an effect.
+
+All of this lives in `gui/`; `core` is untouched by it.
 
 What each kind of operation reports is whatever core already exposes:
 
@@ -247,11 +312,28 @@ per call, which is fine for a query but not for polling several times a second.
 It keeps a byte offset, parses only what was appended, and holds back a trailing
 fragment so a read landing mid-write is not lost.
 
+The log is a best-effort source of *live* progress, not the authority on the final
+state. Core writes a prompt's entry immediately before returning, so the watcher's
+last read routinely misses it, and a prompt that failed before core got as far as
+logging produces no entry at all. Either way a row would be left reading "waiting"
+under a job the panel had already marked complete — which is what left the last
+configuration of a comparison stuck on "waiting". So when a benchmark or comparison
+returns, its watcher is stopped, joined, and every row is then closed from the
+returned result: one entry per prompt for a run, matched by configuration name for
+a comparison. A comparison short enough that the watcher never saw the entry its
+rows are built from has them built from the result instead.
+
+The panel shows no clock. `elapsed_seconds` is still in the snapshot, because
+`progress_cancel` hands that snapshot to the model and how long an operation ran
+before being stopped is worth knowing there, but nothing renders it: a bar, a
+percentage and per-step rows already say where an operation is, and a second
+ticking readout under them was noise.
+
 ### The tools
 
 | Tool | Wraps | Progress shown |
 | --- | --- | --- |
-| `download_start_with_progress` | `DownloadManager.start` | Per-file bars, bytes, overall percentage, ETA |
+| `download_start_with_progress` | `DownloadManager.start` | Per-file bars, bytes, overall percentage |
 | `ollama_run_test_with_progress` | `experiment.run_test` | One row per prompt with its tokens per second |
 | `ollama_compare_tests_with_progress` | `experiment.compare_tests` | One row per configuration, advancing per prompt |
 | `ollama_install_with_progress` | `runtime.install` + `runtime.start` | Indeterminate, per step |
@@ -332,19 +414,62 @@ so nothing about the cancelled operation survives in memory either. The panel
 keeps its final "cancelled" state on screen because the cancel call's own result
 carries that last snapshot.
 
+For a download, the session goes too. Core's `cancel` closes the manager — its
+queue is emptied and it refuses `add` and `start` afterwards — and `main.py`
+removes it from the session registry and calls `purge`, which releases the queue
+and the worker references. So after a cancellation there is no session, no job,
+no queue entry, no worker thread and no downloader left: only the log entry.
+That is what makes starting the same download again produce exactly one new task.
+
+A cancellation is also safe at any stage. Before the queue was started there is
+no worker, so `cancel` marks every item and runs the cleanup itself. Mid-transfer
+it signals an event the worker and the downloader both stop on, and the worker
+runs the cleanup as it exits. Paused counts as mid-transfer: the pause flag is
+released first, or the chunk loop would never reach the check that stops it.
+Cancelling twice is a no-op — the first call owns the outcome, so a later one
+cannot widen a keep-files close into a deletion.
+
 `download_close_session` deliberately does *not* clean up: closing a session is
-bookkeeping, not a request to undo the download, so it passes `cleanup=False` and
-the files stay. Cancelling a queue that already ran to completion also deletes
+bookkeeping, not a request to undo the download, so it keeps the files and only
+drops the session. Cancelling a queue that already ran to completion also deletes
 nothing — there is no unfinished work to undo.
+
+### One job per operation
+
+Every job carries a key identifying the operation it tracks: the download session
+id, the installer path, the model and label of a benchmark. `JobRegistry.create`
+refuses a second *live* job for a key and raises `DuplicateJob`, which the tools
+surface as a `ToolError` naming the bar already running. Two bars over one
+operation would each offer their own Cancel over the same work, and whichever was
+pressed first would undo what the other was still reporting progress for.
+
+The key is released as soon as the job finishes, so starting a finished operation
+again is a new task rather than a duplicate.
+
+A job that has reached a terminal state also stops accepting updates. Its watcher
+thread may still be draining one last reading, and without that a poll landing
+after a cancellation could reopen a step or overwrite `cancelled` with
+`completed` — leaving the panel claiming a download succeeded after its files were
+deleted. Finishing a job drops its canceller and pause controls too, so a late
+button press cannot call into an operation that has already been cleaned up.
 
 ### Jobs
 
 `gui/jobs.py` holds the state the panel reads. A job has a state, optional
-weighted steps, metric chips and a capped log; its percentage is derived from the
-steps unless a caller sets one directly, and `None` means indeterminate. Jobs are
-written from a worker thread and read from whichever thread answers a poll, so
-each guards its fields with a lock and `snapshot()` returns a copy. The registry
-keeps the last 24 jobs and never evicts a running one.
+weighted steps and metric chips; its percentage is derived from the steps unless a
+caller sets one directly, and `None` means indeterminate. Jobs are written from a
+worker thread and read from whichever thread answers a poll, so each guards its
+fields with a lock and `snapshot()` returns a copy.
+
+The registry holds what is running, plus what finished in the last few seconds; it
+never holds a finished job indefinitely, which is what keeps one conversation's
+results out of another's panel (see
+[State isolation](#state-isolation-which-job-a-panel-shows)). Running jobs are
+never dropped, however long they take.
+
+A job keeps no log of its own. Core already writes an execution log entry for
+everything worth recording, and `logs_read` is how that is read back; the panel's
+transcript duplicated it in a window too small to read comfortably, so it is gone.
 
 A cancelling job passes through `cancelling` before `cancelled`: the request has
 been sent but core is still cleaning up. The panel shows that state and holds it,
@@ -370,3 +495,26 @@ ToolError: Error executing tool download_add:
 ```
 
 Core exceptions are forwarded, never caught and replaced.
+
+## Tests
+
+`tests/test_task_lifecycle.py` covers the two properties that are invisible in a
+return value and so easy to regress:
+
+- **Cancellation leaves nothing behind.** A cancelled download has no session, job,
+  queue entry, worker or file left; a cancelled session refuses to be queued to or
+  restarted; restarting an open session does not re-download what already ran; a
+  file that was on disk beforehand is never deleted; cancelling twice does not widen
+  a keep-files close into a deletion.
+- **No task's state reaches another task's panel.** A finished job is not retained
+  past its grace period; an identifier from an earlier run of the server is refused;
+  a panel is never handed a finished job, nor one that was already underway when it
+  opened; each job goes to exactly one panel; and a finished job ignores whatever
+  its watcher does next.
+
+It replaces `Downloader` with a stub that writes to the same paths and honours the
+same pause, skip and cancel flags, so nothing touches the network.
+
+```console
+python -m unittest discover -s tests
+```
