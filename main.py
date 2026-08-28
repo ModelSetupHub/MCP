@@ -87,6 +87,10 @@ Suggested order of operations:
   download_list_allowed_domains are accepted.
 - Core logs every significant operation; logs_read surfaces detail that a
   tool's return value may not include, especially after a failure.
+- When Ollama itself misbehaves — the service will not start, a model fails to
+  load, the GPU is not picked up — its own log files carry detail core never
+  sees: call list_ollama_logs for the available file names and their sizes, then
+  read_ollama_logs with the one you need.
 
 Downloads and benchmarks have a '_with_progress' variant that renders a live
 progress bar in the conversation, with a Cancel button. Prefer those variants;
@@ -266,6 +270,59 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
     @surface_core_errors
     def ollama_get_status() -> dict:
         return runtime.get_status()
+
+    @server.tool(
+        name="list_ollama_logs",
+        title="List Ollama log files",
+        description=(
+            "List the Ollama log files present on this machine with the size of "
+            "each, without reading them: the live app.log and server.log plus "
+            "the rotated app-N.log and server-N.log copies, from "
+            "%LOCALAPPDATA%\\Ollama on Windows or ~/.ollama/logs elsewhere. "
+            "Returns 'sizes' as a {file name: size in bytes} dict for a quick "
+            "comparison, 'files' with each file's full path and modification "
+            "time as well, 'names' alone, and 'total_bytes'; everything is "
+            "ordered most recently modified first. Call this first and use the "
+            "sizes to choose — read_ollama_logs returns a whole file, and "
+            "server.log is often megabytes. Fails when no Ollama log directory "
+            "exists."
+        ),
+        annotations=READ_ONLY,
+    )
+    @surface_core_errors
+    def list_ollama_logs() -> dict:
+        return runtime.list_ollama_logs()
+
+    @server.tool(
+        name="read_ollama_logs",
+        title="Read an Ollama log file",
+        description=(
+            "Read one Ollama log file in full, chosen by the name that "
+            "list_ollama_logs reports — call that first, since the names "
+            "present depend on how often Ollama has rotated its logs. Only a "
+            "bare file name is accepted, not a path. Nothing is truncated, and "
+            "server.log in particular can run to megabytes, so check the sizes "
+            "list_ollama_logs returns and prefer the smallest file that covers "
+            "the period you care about: server.log for why the service or a "
+            "model load failed and for GPU detection, app.log for the desktop "
+            "application. These are Ollama's own logs; logs_read serves this "
+            "project's execution log instead."
+        ),
+        annotations=READ_ONLY,
+    )
+    @surface_core_errors
+    def read_ollama_logs(file_name: str) -> dict:
+        """Read one Ollama log file.
+
+        Args:
+            file_name: Log file name from list_ollama_logs, for example
+                'server.log' or 'app-2.log'.
+
+        Returns:
+            dict: The file's name, path, size, modification time and full
+                contents.
+        """
+        return runtime.read_ollama_logs(file_name=file_name)
 
     @server.tool(
         name="ollama_start",

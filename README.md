@@ -74,7 +74,7 @@ The server speaks JSON-RPC over stdio. Client configuration:
 
 ## Tools
 
-55 tools. 46 are thin pass-throughs to core, grouped by area below; the other 9
+54 tools. 48 are thin pass-throughs to core, grouped by area below; the other 6
 belong to the progress panel and are documented in [Progress panel](#progress-panel).
 Names are prefixed by area, and each carries MCP annotations so a client can tell
 a read-only call from a destructive one.
@@ -94,12 +94,25 @@ a read-only call from a destructive one.
 | Tool | Core function |
 | --- | --- |
 | `ollama_get_status` | `get_status` |
+| `list_ollama_logs` | `list_ollama_logs` |
+| `read_ollama_logs` | `read_ollama_logs` |
 | `ollama_start` | `start` |
 | `ollama_stop` | `stop` |
 | `ollama_install` | `install` |
 
 The mutating three return `get_status()` afterwards, since the core functions
 return `None`.
+
+The two log tools read Ollama's own log files — the live `app.log` and
+`server.log` plus every rotated copy — and are unrelated to `logs_read`, which
+reads this project's execution log. They work as a pair: `list_ollama_logs`
+returns a `{file name: size in bytes}` dict, alongside per-file paths and
+modification times, and `read_ollama_logs` takes one of those names and returns
+that file in full. Splitting it that way keeps the caller from pulling megabytes
+it did not ask for, and the sizes are what make the choice informed —
+`server.log` alone routinely passes a megabyte, and it is the one file that says
+why a service start or model load failed. `read_ollama_logs` accepts a bare file
+name only, so a path cannot reach outside the log directories.
 
 ### Ollama models — `core.ollama.model`
 
@@ -213,7 +226,7 @@ The panel is an [MCP Apps](https://modelcontextprotocol.io) extension
 (`io.modelcontextprotocol/ui`), which the SDK ships as `mcp.server.apps`. A tool
 advertises `_meta.ui.resourceUri` pointing at a `ui://` HTML resource, and the
 client renders that resource in a sandboxed iframe inline in the conversation.
-The extension is purely additive: it contributes one resource and nine tools,
+The extension is purely additive: it contributes one resource and six tools,
 and intercepts nothing.
 
 An app resource is a single self-contained HTML document — the iframe has no
@@ -347,9 +360,6 @@ ticking readout under them was noise.
 | `download_start_with_progress` | `DownloadManager.start` | Per-file bars, bytes, overall percentage |
 | `ollama_run_test_with_progress` | `experiment.run_test` | One row per prompt with its tokens per second |
 | `ollama_compare_tests_with_progress` | `experiment.compare_tests` | One row per configuration, advancing per prompt |
-| `ollama_install_with_progress` | `runtime.install` + `runtime.start` | Indeterminate, per step |
-| `python_install_python_with_progress` | `installer.install_python` | Indeterminate |
-| `python_install_packages_with_progress` | `tools.install_packages` | One row per package |
 | `progress_get_status` | — | The panel's own poll target |
 | `progress_cancel` | — | The Cancel button's target |
 | `progress_pause` | — | The Stop button's target (downloads only) |
