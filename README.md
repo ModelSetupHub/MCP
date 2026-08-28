@@ -21,8 +21,6 @@ job bookkeeping behind it.
 │       ├── progress.html
 │       ├── progress.css
 │       └── progress.js
-├── tests/
-│   └── test_task_lifecycle.py   # cancellation and task-lifecycle tests
 ├── requirements.txt
 └── Core/              # submodule
     └── core/          # backend logic
@@ -287,11 +285,24 @@ badge, buttons, metrics and step rows are all cleared before the new one is draw
 so no fragment of one task appears under another's title. A snapshot for any other
 job is dropped rather than rendered.
 
-When a stored panel's id names something the server no longer has, the panel says
-so — "Progress no longer available", with an empty bar — rather than falling back
-to whatever is running now. That is the case the reopened-chat leak turned into a
-wrong reading; showing nothing is the honest answer, and the outcome is in the
-conversation and the execution log either way.
+### Reopening a conversation
+
+A restored panel has no job to poll: the tool call it belongs to ran in the past
+and is not running again, so the server will never create one. Left alone the panel
+sits on "Starting…" indefinitely, waiting for something that is not coming.
+
+So a panel gives up after `STARTUP_GRACE_MS` — a live operation's job exists within
+a few hundred milliseconds of the panel opening, so anything past a few seconds is
+a restored panel — and then rebuilds a final frame from the tool result the host
+replays alongside it. That result carries the operation's own outcome: the per-prompt
+rates of a benchmark, the per-configuration averages of a comparison, the queue of a
+download. The bar fills, the rows show what each step produced, and the subtitle says
+it finished earlier in the conversation. Nothing is read from the server, so nothing
+can be borrowed from another task.
+
+When there is no result to rebuild from — a panel whose tool errored, say — it says
+"Progress no longer available" with an empty bar instead. Either way the panel shows
+its *own* operation or nothing, never whatever happens to be running now.
 
 `progress_cancel` and `progress_pause` called without an id act on the newest
 operation still *running*, which is what the model means by "cancel the download"
@@ -495,26 +506,3 @@ ToolError: Error executing tool download_add:
 ```
 
 Core exceptions are forwarded, never caught and replaced.
-
-## Tests
-
-`tests/test_task_lifecycle.py` covers the two properties that are invisible in a
-return value and so easy to regress:
-
-- **Cancellation leaves nothing behind.** A cancelled download has no session, job,
-  queue entry, worker or file left; a cancelled session refuses to be queued to or
-  restarted; restarting an open session does not re-download what already ran; a
-  file that was on disk beforehand is never deleted; cancelling twice does not widen
-  a keep-files close into a deletion.
-- **No task's state reaches another task's panel.** A finished job is not retained
-  past its grace period; an identifier from an earlier run of the server is refused;
-  a panel is never handed a finished job, nor one that was already underway when it
-  opened; each job goes to exactly one panel; and a finished job ignores whatever
-  its watcher does next.
-
-It replaces `Downloader` with a stub that writes to the same paths and honours the
-same pause, skip and cancel flags, so nothing touches the network.
-
-```console
-python -m unittest discover -s tests
-```

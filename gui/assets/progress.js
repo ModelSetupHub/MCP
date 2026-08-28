@@ -28,6 +28,13 @@
   var FIRST_POLL_INTERVAL_MS = 150;
   var POLL_INTERVAL_MS = 600;
 
+  // How long a panel waits on "Starting…" for a job to appear before concluding
+  // there is not going to be one. A live operation's job exists within a few
+  // hundred milliseconds of the panel opening, so anything past this is a panel
+  // restored with its conversation — the tool call it belongs to ran long ago and
+  // will not run again. Without a bound, such a panel waits for ever.
+  var STARTUP_GRACE_MS = 4000;
+
   var TERMINAL = { completed: 1, failed: 1, cancelled: 1 };
 
   var pending = {};
@@ -44,6 +51,12 @@
   var pausePending = false;
   var finished = false;
   var lastSnapshot = null;
+  // When polling began, so a panel that never finds a job can stop waiting.
+  var startedPollingAt = 0;
+  // The tool result this panel was created with, as the host replays it when a
+  // conversation is reopened. It carries the operation's own outcome, so a panel
+  // whose job the server has since dropped can still show a real final frame.
+  var storedResult = null;
 
   var dom = {};
 
@@ -195,6 +208,12 @@
       pinTo(envelope.progress_id, true);
     }
 
+    // Kept so a restored panel can draw a real final frame from the operation's
+    // own outcome once it learns the server no longer has the job.
+    if (envelope) {
+      storedResult = envelope;
+    }
+
     // The tool returning does not always mean the work is over: a download tool
     // hands back a queue status and lets the transfer continue on a background
     // thread. So this only forces a refresh — polling stops when a snapshot
@@ -293,6 +312,7 @@
     if (pollTimer !== null) {
       return;
     }
+    startedPollingAt = Date.now();
     poll();
     schedule(FIRST_POLL_INTERVAL_MS);
   }
@@ -345,6 +365,15 @@
             // conversation was reopened after the operation ended, or the server
             // has restarted since. Say so and stop. Showing whatever is running
             // now instead is exactly the leak this guards against.
+            finished = true;
+            stopPolling();
+            renderUnavailable();
+          } else if (Date.now() - startedPollingAt > STARTUP_GRACE_MS) {
+            // No job has appeared and none is coming. This is a panel restored
+            // with its conversation: the host re-renders it, but the tool call it
+            // belongs to ran in the past and is not running again, so no job will
+            // ever be created for it. Waiting longer would leave "Starting…" on
+            // screen indefinitely.
             finished = true;
             stopPolling();
             renderUnavailable();
@@ -662,10 +691,19 @@
   }
 
   // The panel's own operation is not on the server: the conversation was reopened
-  // after it ended, or the server has restarted. The bar is emptied rather than
-  // filled in from whatever else is running, because the honest thing to show is
-  // that this record is no longer live.
+  // after it ended, or the server has restarted. The tool result the host replays
+  // alongside the panel carries that operation's own outcome, so the final frame
+  // is rebuilt from it — a filled bar with the rows it finished. Only when there
+  // is no result to read does the panel fall back to saying so. Either way nothing
+  // is taken from whatever else happens to be running.
   function renderUnavailable() {
+    var restored = restoredFrame(storedResult);
+
+    if (restored) {
+      render(restored);
+      return;
+    }
+
     dom.title.textContent = "Progress no longer available";
     dom.badge.dataset.state = "completed";
     dom.badge.textContent = "ended";
@@ -681,6 +719,94 @@
       "This operation has ended. Its outcome is in the conversation, and " +
         "logs_read has the full record."
     );
+  }
+
+  // Rebuild a finished snapshot from the tool result the panel was created with.
+  // Only the shapes these tools actually return are handled; anything else gives
+  // null and the caller says the record is no longer available.
+  function restoredFrame(envelope) {
+    if (!envelope) {
+      return null;
+    }
+
+    var steps = null;
+    var title = null;
+
+    var payload = envelope.result;
+    var status = envelope.status;
+
+    if (payload && Array.isArray(payload.results)) {
+      // A single benchmark: one row per prompt.
+      title = "Benchmarked " + (payload.model || "model");
+      steps = payload.results.map(function (entry, index) {
+        return {
+          name: "prompt " + (entry.index || index + 1),
+          state: entry.success === false ? "failed" : "completed",
+          percent: 100,
+          detail: rateOf(entry),
+          note: entry.error || null,
+        };
+      });
+    } else if (payload && Array.isArray(payload.tests)) {
+      // A comparison: one row per configuration.
+      title = "Compared " + payload.tests.length + " configuration(s)";
+      steps = payload.tests.map(function (test) {
+        var results = test.results || [];
+        var summary = test.summary || {};
+        var rate = summary.average_output_tokens_per_second;
+        var count = results.length + "/" + results.length;
+        return {
+          name: test.name || "configuration",
+          state: "completed",
+          percent: 100,
+          detail:
+            typeof rate === "number" ? count + " · " + rate.toFixed(1) + " tok/s" : count,
+          note: null,
+        };
+      });
+    } else if (status && Array.isArray(status.downloads)) {
+      // A download queue: one row per file.
+      title = "Downloaded " + status.downloads.length + " file(s)";
+      steps = status.downloads.map(function (item) {
+        return {
+          name: item.filename || "file",
+          state: item.status === "completed" ? "completed" : item.status,
+          percent: item.status === "completed" ? 100 : null,
+          detail: item.status,
+          note: item.error || null,
+        };
+      });
+    }
+
+    if (!steps || !steps.length) {
+      return null;
+    }
+
+    return {
+      progress_id: envelope.progress_id || null,
+      tracked: true,
+      title: title,
+      subtitle: "Finished earlier in this conversation.",
+      state: "completed",
+      percent: 100,
+      determinate: true,
+      cancellable: false,
+      pausable: false,
+      paused: false,
+      cancelling: false,
+      steps: steps,
+      metrics: [],
+    };
+  }
+
+  function rateOf(entry) {
+    if (typeof entry.output_tokens_per_second === "number") {
+      return entry.output_tokens_per_second.toFixed(1) + " tok/s";
+    }
+    if (typeof entry.duration_seconds === "number") {
+      return entry.duration_seconds.toFixed(1) + "s";
+    }
+    return null;
   }
 
   /* ---------------------------------------------------------------- utilities */
