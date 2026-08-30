@@ -1,17 +1,33 @@
 """Frontend layer for the ModelSetupHub MCP server.
 
-Holds everything to do with the in-chat progress panel, kept out of ``main.py``:
+Everything to do with the in-chat progress panel, kept out of ``main.py``:
 
 - ``assets/`` — the panel's HTML, CSS and JavaScript, one file each.
 - ``loader`` — inlines those assets into the single HTML document an MCP Apps
   ``ui://`` resource has to be.
-- ``jobs`` — the job model and registry the panel reads progress from.
-- ``logtail`` — incremental reader for the execution log core already writes.
-- ``tracking`` — runs the unmodified core operations and publishes their progress.
-- ``app`` — the Apps extension: the ``ui://`` resource plus the tools bound to it.
+- ``jobs`` — the ``Job`` model and the registry of jobs running now.
+- ``store`` — the persisted snapshots, which are the source of truth.
+- ``workers`` — the threads that run the operations and keep their jobs current.
+- ``logtail`` — incremental reader for the execution log, used only by the
+  benchmark worker.
+- ``app`` — the Apps extension: the ``ui://`` resource plus the tools bound to it,
+  and ``register_progress_tools`` for the plain tools the model polls with.
+
+The shape of the system:
+
+    a tracked tool  → creates a Job, persists it, starts a worker, returns its id
+    the worker      → updates the Job, persists snapshots, finishes it exactly once
+    the panel       → polls its own app-visible status tool with that id and draws
+                      the result
+    the model       → polls the plain progress_get_status with the same id
+
+Only the three tools that start an operation are bound to the panel, because a
+client renders one panel per tool result: binding the poll would draw a second bar
+for every poll of the first.
 
 ``main.py`` imports ``create_progress_app`` from here and passes the result to
-``MCPServer(extensions=[...])``.
+``MCPServer(extensions=[...])``, and calls ``register_progress_tools`` alongside
+its own registrars.
 """
 
 from pathlib import Path
@@ -20,13 +36,22 @@ import sys
 # This package imports core, and core imports itself as a top-level package, so
 # the Core submodule root has to be on sys.path first. main.py does this before
 # importing anything, but repeating it here — it is idempotent — keeps the gui
-# package importable on its own, for a test or a REPL.
+# package importable on its own, for a REPL.
 _CORE_ROOT = Path(__file__).resolve().parent.parent / "Core"
 
 if str(_CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CORE_ROOT))
 
-from .app import PROGRESS_URI, create_progress_app  # noqa: E402
-from .tracking import note_download_ended  # noqa: E402
+from .app import (  # noqa: E402
+    PROGRESS_URI,
+    create_progress_app,
+    register_progress_tools,
+)
+from .workers import note_download_ended  # noqa: E402
 
-__all__ = ["PROGRESS_URI", "create_progress_app", "note_download_ended"]
+__all__ = [
+    "PROGRESS_URI",
+    "create_progress_app",
+    "register_progress_tools",
+    "note_download_ended",
+]

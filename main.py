@@ -60,9 +60,14 @@ from core.download_manager.manager import (  # noqa: E402
 from core.ollama import experiment, model, runtime  # noqa: E402
 from core.python import environment, installer, tools  # noqa: E402
 
-# The in-chat progress panel and the tools bound to it. Every frontend file lives
-# under gui/; this layer only hands it a way to resolve a download session.
-from gui import create_progress_app, note_download_ended  # noqa: E402
+# The in-chat progress panel, the tools that draw it, and the plain tools that
+# read one afterwards. Every frontend file lives under gui/; this layer only hands
+# it a way to resolve a download session.
+from gui import (  # noqa: E402
+    create_progress_app,
+    note_download_ended,
+    register_progress_tools,
+)
 
 SERVER_NAME = "modelsetuphub"
 SERVER_TITLE = "ModelSetupHub"
@@ -92,30 +97,55 @@ Suggested order of operations:
   sees: call list_ollama_logs for the available file names and their sizes, then
   read_ollama_logs with the one you need.
 
-Downloads and benchmarks have a '_with_progress' variant that renders a live
-progress bar in the conversation, with a Cancel button. Prefer those variants;
-they return the same data as the plain tool, plus a progress_id. Clients that
-cannot render the panel still get the return value. Installations have no
-progress variant — call the plain tools for those.
+Downloads and benchmarks have a '_with_progress' variant that runs the work in
+the background and renders a live progress bar in the conversation. Both return a
+progress_id immediately, and progress_get_status(progress_id) reports the state:
+'starting' or 'running' while the work continues, then 'completed', 'failed' or
+'cancelled'. That call is fast and never blocks. An unknown id reports
+found=false; it is never answered with another operation. Installations have no
+progress variant.
 
-Two different controls act on a running operation:
+One operation is one progress_id and one progress bar. The bar belongs to the
+starting call and updates itself; progress_get_status only reads the state and
+draws nothing, so polling it as often as needed adds no second bar and costs
+nothing. Always poll with the progress_id the starting tool returned — never start
+the operation again to check on it.
+
+The two kinds of operation are asked for different things, so they end
+differently:
+
+- download_start_with_progress is fire-and-monitor. Starting the transfer is the
+  whole of the tool's job, so there is nothing to collect afterwards. Continue
+  with other work and poll progress_get_status only when the outcome matters.
+- ollama_run_test_with_progress and ollama_compare_tests_with_progress are asked
+  for measurements, and starting them is not delivering those. Their response is
+  an acknowledgement carrying a progress_id, with no results in it. Poll
+  progress_get_status until the status is terminal, and on 'completed' call
+  benchmark_get_result(progress_id) to obtain the measurements. Only then is the
+  benchmark done: do not describe results, compare configurations or recommend
+  settings before retrieving them. A failed or cancelled run produces no
+  measurements, and benchmark_get_result will say so.
+
+Prefer the plain ollama_run_test or ollama_compare_tests when the measurements are
+wanted from a single call and no progress bar is needed.
+
+Two different controls act on a running operation, both taking its progress_id:
 
 - progress_cancel ends the task and has core undo it — partial and completed
-  downloads are deleted, a loaded model is unloaded — leaving only a
-  'cancelled' entry in the execution log, which logs_read will show. It applies
-  to downloads and benchmarks alike, and cannot be undone.
+  downloads are deleted, a loaded model is unloaded — leaving a 'cancelled'
+  entry in the execution log, which logs_read will show. It applies to
+  downloads and benchmarks alike, and cannot be undone.
 - progress_pause stops a download without cancelling it: the queue and the bytes
   already fetched are kept, and calling it again resumes from where it left off.
   Downloads only.
 
-A cancelled operation is removed completely, not left in a cancelled state. For a
-download that includes the session itself: its id becomes free, and downloading
-the same files again means calling download_create_session and download_add
-again. Do not try to restart or add to a cancelled session — it will refuse.
+Cancelling a download removes the session too: its id becomes free, and
+downloading the same files again means calling download_create_session and
+download_add again. Do not try to restart or add to a cancelled session — it
+will refuse.
 
-One operation is tracked by one progress bar. Starting a download or benchmark
-that is already running is rejected rather than started twice; poll the
-progress bar named in the error, or cancel it first.
+Starting a download that is already downloading is rejected rather than started
+twice; poll the progress bar named in the error, or cancel it first.
 
 Tools that delete models, environments, script files, or queued downloads are
 irreversible and are annotated as destructive. Confirm the target before
@@ -283,9 +313,9 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
             "comparison, 'files' with each file's full path and modification "
             "time as well, 'names' alone, and 'total_bytes'; everything is "
             "ordered most recently modified first. Call this first and use the "
-            "sizes to choose — read_ollama_logs returns a whole file, and "
-            "server.log is often megabytes. Fails when no Ollama log directory "
-            "exists."
+            "sizes to choose — read_ollama_logs returns a whole file unless a "
+            "line range is requested, and server.log is often megabytes. Fails "
+            "when no Ollama log directory exists."
         ),
         annotations=READ_ONLY,
     )
@@ -297,32 +327,47 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="read_ollama_logs",
         title="Read an Ollama log file",
         description=(
-            "Read one Ollama log file in full, chosen by the name that "
+            "Read one Ollama log file chosen by the name that "
             "list_ollama_logs reports — call that first, since the names "
             "present depend on how often Ollama has rotated its logs. Only a "
-            "bare file name is accepted, not a path. Nothing is truncated, and "
-            "server.log in particular can run to megabytes, so check the sizes "
-            "list_ollama_logs returns and prefer the smallest file that covers "
-            "the period you care about: server.log for why the service or a "
-            "model load failed and for GPU detection, app.log for the desktop "
-            "application. These are Ollama's own logs; logs_read serves this "
-            "project's execution log instead."
+            "bare file name is accepted, not a path. By default the whole "
+            "file is returned with nothing truncated, and server.log in "
+            "particular can run to megabytes — so check the sizes "
+            "list_ollama_logs returns, prefer the smallest file that covers "
+            "the period you care about, and pass start_line and end_line "
+            "(1-based and inclusive; end_line may be omitted to read through "
+            "the end) to page through the large ones instead. The response "
+            "reports 'total_lines', so a range that comes back empty started "
+            "past the end of the file. server.log is the one that says why "
+            "the service or a model load failed and for GPU detection, "
+            "app.log for the desktop application. These are Ollama's own "
+            "logs; logs_read serves this project's execution log instead."
         ),
         annotations=READ_ONLY,
     )
     @surface_core_errors
-    def read_ollama_logs(file_name: str) -> dict:
-        """Read one Ollama log file.
+    def read_ollama_logs(
+        file_name: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> dict:
+        """Read one Ollama log file, in full or a line range.
 
         Args:
             file_name: Log file name from list_ollama_logs, for example
                 'server.log' or 'app-2.log'.
+            start_line: First line to return, 1-based. Optional.
+            end_line: Last line to return, inclusive. Optional.
 
         Returns:
-            dict: The file's name, path, size, modification time and full
-                contents.
+            dict: The file's name, path, size, modification time, total line
+                count, and the contents of the requested lines.
         """
-        return runtime.read_ollama_logs(file_name=file_name)
+        return runtime.read_ollama_logs(
+            file_name=file_name,
+            start_line=start_line,
+            end_line=end_line,
+        )
 
     @server.tool(
         name="ollama_start",
@@ -1648,6 +1693,10 @@ REGISTRARS = (
     register_python_tools,
     register_download_tools,
     register_logging_tools,
+    # Reading and controlling a progress bar. Registered here rather than on the
+    # Apps extension because a tool bound to the panel is drawn every time the
+    # model calls it, and the model polls these repeatedly by design.
+    register_progress_tools,
 )
 
 

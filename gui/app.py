@@ -1,22 +1,39 @@
-"""The progress panel as an MCP Apps extension.
+"""The progress panel: its MCP Apps extension, and the tools that read it.
 
 MCP Apps (``io.modelcontextprotocol/ui``) is how a tool result carries a UI: the
 tool advertises ``_meta.ui.resourceUri``, which points at a ``ui://`` HTML
-resource the client renders inline in the conversation — the same chat page the
-tool was called from, in a sandboxed iframe.
+resource the client renders inline in the conversation, in a sandboxed iframe.
 
-Two kinds of tool live here:
+That binding is what draws a progress bar, so it decides which tools may have it.
+A tool bound to the panel gets a new panel every time the *model* calls it, since
+each call is a new tool result in the conversation for the host to render. So only
+the three tools that start an operation are bound to it — one call, one job, one
+bar — and everything that merely *reads* or *controls* an existing job is a plain
+tool, registered by :func:`register_progress_tools`, with no UI of its own.
 
-- The long-running operations that expose measurable progress — downloads and
-  benchmarks — each bound to the panel. They delegate to ``gui.tracking``, which
-  runs the unmodified core function and publishes progress alongside it.
-- ``progress_get_status``, which the panel polls. It is marked
-  ``visibility=["app"]`` so it serves the panel without cluttering the model's
-  tool list.
+Two surfaces, therefore, over one implementation:
 
-Every tool here degrades to plain text: a client that did not negotiate Apps
-receives the same return value it would from the corresponding tool in
-``main.py``, minus the panel.
+- The model calls ``progress_get_status``, ``benchmark_get_result``,
+  ``progress_cancel`` and ``progress_pause``. None is bound to the panel, so
+  polling a benchmark to completion adds no second bar to the conversation.
+- The panel calls ``progress_panel_status``, ``progress_panel_cancel`` and
+  ``progress_panel_pause`` over its postMessage bridge. These are bound to the
+  panel and marked ``visibility=["app"]``, so they serve the view it belongs to
+  without appearing in the model's tool list. A call the panel makes itself is
+  answered back to the iframe rather than added to the conversation, which is why
+  polling twice a second never renders anything.
+
+Both surfaces call the same four functions below, so the model and the view can
+never disagree about a job.
+
+One identifier, one lookup. A status request resolves the exact id it is given:
+the running job when there is one, its persisted record otherwise. There is no
+search, no fallback and no guessing, so a request for one run can never be
+answered with another. Live and reopened panels take the same path, because there
+is only one.
+
+Every tool degrades to plain text: a client that did not negotiate Apps receives
+the same return value it would from the corresponding tool in ``main.py``.
 """
 
 from __future__ import annotations
@@ -29,8 +46,8 @@ from mcp.server.apps import Apps
 from mcp.server.mcpserver.exceptions import MCPServerError, ToolError
 from mcp.types import ToolAnnotations
 
-from . import tracking
-from .jobs import DuplicateJob, registry
+from . import store, workers
+from .jobs import Job, registry
 from .loader import load_progress_app_html
 
 PROGRESS_URI = "ui://modelsetuphub/progress.html"
@@ -48,8 +65,8 @@ CallableT = TypeVar("CallableT", bound=Callable[..., Any])
 def surface_core_errors(function: CallableT) -> CallableT:
     """Forward exceptions raised by core to the MCP client verbatim.
 
-    Mirrors the decorator in ``main.py``: the SDK reports any exception other
-    than ``ToolError`` as a generic tool crash, which would hide the descriptive
+    Mirrors the decorator in ``main.py``: the SDK reports any exception other than
+    ``ToolError`` as a generic tool crash, which would hide the descriptive
     messages core raises.
 
     Args:
@@ -75,19 +92,25 @@ def create_progress_app(
     get_session: Callable[[str], Any],
     release_session: Callable[[str], Any] | None = None,
 ) -> Apps:
-    """Build the Apps extension carrying the panel and its tools.
+    """Build the Apps extension carrying the panel and the tools that draw it.
+
+    Only the tools that *start* an operation are bound to the panel, plus the
+    panel's own app-visible ones. Reading and controlling a job that already exists
+    is registered separately by :func:`register_progress_tools`, so the model can
+    poll a benchmark without every poll rendering another progress bar.
 
     Args:
         get_session: Resolver for a download session id, supplied by the layer
-            that owns the session registry — ``main.py`` — so this module does
-            not duplicate that state.
+            that owns the session registry — ``main.py`` — so this module does not
+            duplicate that state.
         release_session: Called with a session id once its queue has stopped, so
-            the owning layer can drop a cancelled session. Downloads that
-            completed normally are left registered.
+            the owning layer can drop a cancelled session.
 
     Returns:
         Apps: Extension to pass as ``MCPServer(extensions=[...])``.
     """
+    workers.release_session = release_session
+
     apps = Apps()
 
     apps.add_html_resource(
@@ -102,33 +125,48 @@ def create_progress_app(
         prefers_border=False,
     )
 
-    register_status_tool(apps)
-    register_control_tools(apps)
-    register_download_tools(apps, get_session, release_session)
-    register_benchmark_tools(apps)
+    _register_panel_tools(apps)
+    _register_download(apps, get_session)
+    _register_benchmarks(apps)
 
     return apps
 
 
-def register_status_tool(apps: Apps) -> None:
-    """Register the tool the panel polls for progress.
+def register_progress_tools(server: Any) -> None:
+    """Register the tools that read and control an operation already running.
+
+    Deliberately plain tools, on the server rather than the Apps extension. A tool
+    bound to the panel renders one every time the model calls it, and the model
+    calls these repeatedly by design — a benchmark is polled until it finishes.
+    Binding them would turn one benchmark into a row of progress bars, each drawn
+    from a poll's answer rather than from the run itself.
+
+    They return exactly what the panel's own tools return, because both call the
+    same four functions.
 
     Args:
-        apps: Extension the tool is added to.
+        server: Server instance the tools are attached to, matching the registrars
+            in ``main.py``.
     """
 
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
-        visibility=["app"],
+    @server.tool(
         name="progress_get_status",
         title="Get operation progress",
         description=(
-            "Report a tracked operation's progress: state, overall percentage, "
-            "per-step rows and metrics. With no id, claims the newest operation "
-            "no progress bar has adopted yet — which is how a freshly opened "
-            "panel finds the operation it was opened for. The progress panel "
-            "polls this while an operation runs; it is not normally called "
-            "directly."
+            "Report one asynchronous operation's current state, by the progress_id "
+            "its tracked tool returned. Fast and non-blocking: it reads the "
+            "operation's recorded state, it does not wait for it. Returns status — "
+            "'starting' or 'running' while the work continues, then one of "
+            "'completed', 'failed' or 'cancelled' — with an overall percentage, a "
+            "message, per-step rows, and an error when there is one. For a "
+            "benchmark, 'result_available': true on a completed run means the "
+            "measurements are ready to fetch with benchmark_get_result; the "
+            "measurements are never included here. Poll this until the status is "
+            "terminal; polling costs nothing and adds nothing to the conversation, "
+            "and the operation's own progress bar keeps updating itself either way. "
+            "Answers while the operation runs and afterwards, including after this "
+            "server restarts. An unknown id reports found=false rather than another "
+            "operation's progress."
         ),
         annotations=ToolAnnotations(
             read_only_hint=True,
@@ -138,99 +176,55 @@ def register_status_tool(apps: Apps) -> None:
         ),
     )
     @surface_core_errors
-    def progress_get_status(progress_id: str | None = None) -> dict:
-        """Return one operation's progress snapshot.
-
-        A panel is rendered as soon as its tool call is issued, before the server
-        has created the job, so its first polls arrive without an id. Those are
-        answered by ``claim_unclaimed``, which hands over a job only when it is
-        running, unclaimed and seconds old — never simply the newest, which during
-        that window is the previous operation's and would leave the new panel
-        showing a task that had already finished.
-
-        An id from an earlier run of this server, or naming a job that has since
-        expired, resolves to nothing rather than to whatever is current.
+    def progress_get_status(progress_id: str) -> dict:
+        """Return one job's snapshot.
 
         Args:
-            progress_id: Identifier reported by a tracked tool; omit to claim the
-                caller's own operation.
+            progress_id: Identifier returned by a tracked tool.
 
         Returns:
-            dict: Progress snapshot, or a placeholder when nothing is tracked.
+            dict: The snapshot, or a not-found response.
         """
-        job = (
-            registry.get(progress_id)
-            if progress_id
-            else registry.claim_unclaimed()
-        )
+        return read_status(progress_id)
 
-        if job is None:
-            return _untracked(progress_id)
+    @server.tool(
+        name="benchmark_get_result",
+        title="Get a finished benchmark's measurements",
+        description=(
+            "Retrieve the measurements produced by a benchmark started with "
+            "ollama_run_test_with_progress or ollama_compare_tests_with_progress, "
+            "by its progress_id. This is where a benchmark's actual results come "
+            "from: the starting tool returns only a handle, and progress_get_status "
+            "reports only progress. Call this once progress_get_status reports "
+            "status='completed' and result_available=true — earlier it reports that "
+            "the benchmark is still running, and for a failed or cancelled run it "
+            "reports that there are no measurements. Returns the same per-prompt "
+            "timings, token counts and averaged summary the synchronous "
+            "ollama_run_test and ollama_compare_tests return."
+        ),
+        annotations=ToolAnnotations(
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        ),
+    )
+    @surface_core_errors
+    def benchmark_get_result(progress_id: str) -> dict:
+        """Return a finished benchmark's measurements.
 
-        return job.snapshot()
+        Args:
+            progress_id: Identifier returned by a benchmark tool.
 
+        Returns:
+            dict: The measurements, or an explanation of why there are none yet.
+        """
+        return read_result(progress_id)
 
-def _untracked(progress_id: str | None) -> dict:
-    """Build the placeholder for a job that does not exist.
-
-    Returned both before an operation has registered its job and after a
-    cancelled one has been purged. ``tracked`` tells the panel which case it is
-    looking at, so it can keep showing "starting" in the first and hold the final
-    state in the second, instead of flashing this placeholder in either.
-
-    Args:
-        progress_id: Identifier that was asked for, if any.
-
-    Returns:
-        dict: Snapshot-shaped placeholder.
-    """
-    return {
-        "progress_id": progress_id,
-        "tracked": False,
-        "title": "Nothing to report",
-        "subtitle": None,
-        "state": "completed",
-        "percent": None,
-        "determinate": False,
-        "cancellable": False,
-        "pausable": False,
-        "paused": False,
-        "cancelling": False,
-        "steps": [],
-        "metrics": [],
-        "elapsed_seconds": 0.0,
-    }
-
-
-def register_control_tools(apps: Apps) -> None:
-    """Register the panel's Cancel and Stop buttons.
-
-    The two are deliberately different operations. Cancel ends the task and has
-    core undo it, and applies to both tracked operations. Stop only suspends a
-    download and leaves the task intact, so it exists for downloads alone — they
-    are the only operation core can pause and resume.
-
-    Args:
-        apps: Extension the tools are added to.
-    """
-
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
+    @server.tool(
         name="progress_cancel",
         title="Cancel a running operation",
-        description=(
-            "Cancel a tracked operation and undo what it had done so far. The "
-            "download or benchmark stops at its next safe point, core removes "
-            "everything the operation created — partial and completed downloads, "
-            "a loaded model — and records a cancelled entry in the execution log, "
-            "which is the only trace left behind. The operation is "
-            "then removed completely: its progress bar, its job and, for a "
-            "download, the session itself, so starting the same work again means "
-            "creating it fresh and produces exactly one new task. Cannot be "
-            "undone; to suspend a download and keep it, use progress_pause "
-            "instead. With no id, cancels the most recently started operation. "
-            "The progress panel's Cancel button calls this."
-        ),
+        description=CANCEL_DESCRIPTION,
         annotations=ToolAnnotations(
             read_only_hint=False,
             destructive_hint=True,
@@ -239,48 +233,21 @@ def register_control_tools(apps: Apps) -> None:
         ),
     )
     @surface_core_errors
-    def progress_cancel(progress_id: str | None = None) -> dict:
-        """Cancel a tracked operation and wait for its cleanup to finish.
+    def progress_cancel(progress_id: str) -> dict:
+        """Cancel one operation and wait for its cleanup.
 
         Args:
-            progress_id: Identifier reported by a tracked tool; omit for the
-                newest operation that is still running.
+            progress_id: Identifier returned by a tracked tool.
 
         Returns:
-            dict: Final progress snapshot after the cleanup, with
-            ``cancel_requested`` false when the operation had already finished.
+            dict: Final snapshot after the cleanup.
         """
-        job = (
-            registry.get(progress_id)
-            if progress_id
-            else registry.latest_active()
-        )
+        return cancel_operation(progress_id)
 
-        if job is None:
-            snapshot = _untracked(progress_id)
-            snapshot["title"] = "Nothing to cancel"
-            snapshot["subtitle"] = (
-                "That operation is not running; nothing was changed."
-            )
-            snapshot["cancel_requested"] = False
-            return snapshot
-
-        return tracking.cancel_job(job)
-
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
+    @server.tool(
         name="progress_pause",
         title="Stop or resume a download",
-        description=(
-            "Stop a running download without cancelling it, or resume one that "
-            "was stopped. The queue, the files already fetched and the partial "
-            "data are all kept, and resuming continues the active file from where "
-            "it left off via an HTTP range request. Downloads only: benchmarks "
-            "cannot be suspended, and calling this for one "
-            "reports that it is unavailable rather than cancelling it. With no "
-            "id, targets the most recently started operation. The progress "
-            "panel's Stop button calls this."
-        ),
+        description=PAUSE_DESCRIPTION,
         annotations=ToolAnnotations(
             read_only_hint=False,
             destructive_hint=False,
@@ -289,46 +256,387 @@ def register_control_tools(apps: Apps) -> None:
         ),
     )
     @surface_core_errors
-    def progress_pause(progress_id: str | None = None) -> dict:
-        """Stop or resume a tracked download.
+    def progress_pause(progress_id: str) -> dict:
+        """Suspend or continue one download.
 
         Args:
-            progress_id: Identifier reported by a tracked tool; omit for the
-                newest operation that is still running.
+            progress_id: Identifier returned by a tracked tool.
 
         Returns:
-            dict: Progress snapshot afterwards, with ``pause_action`` set to
-            ``paused``, ``resumed`` or ``unavailable``.
+            dict: Snapshot afterwards, with ``pause_action``.
         """
-        job = (
-            registry.get(progress_id)
-            if progress_id
-            else registry.latest_active()
+        return pause_operation(progress_id)
+
+
+def _snapshot(progress_id: str) -> dict | None:
+    """Resolve one job's current snapshot.
+
+    The single read path, used by the panel whether it is following a live
+    operation or showing one after the conversation was reopened. The running job
+    answers when there is one, because its record trails it by up to half a second;
+    otherwise the record does, which is why a finished run survives a restart.
+
+    Args:
+        progress_id: Identifier returned by a tracked tool.
+
+    Returns:
+        dict | None: The snapshot, or None when no such job exists.
+    """
+    job = registry.get(progress_id)
+
+    return job.snapshot() if job is not None else store.load(progress_id)
+
+
+def _not_found(progress_id: str | None) -> dict:
+    """Build the answer for an identifier that names no job.
+
+    ``found`` is false and there is no status: a missing job has no lifecycle
+    state, and reporting one would let the panel treat a bad id — or a record
+    pruned months later — as an operation that ended.
+
+    Args:
+        progress_id: Identifier that was asked for.
+
+    Returns:
+        dict: Not-found response.
+    """
+    return {
+        "id": progress_id,
+        "found": False,
+        "message": (
+            "No operation is recorded under that progress_id. It may have been "
+            "mistyped, or its record may have been pruned."
+        ),
+    }
+
+
+def read_status(progress_id: str) -> dict:
+    """Report one operation's current state.
+
+    The one implementation behind both status tools: the model's plain
+    ``progress_get_status`` and the panel's ``progress_panel_status``. Polling it
+    is a read and nothing else — no job is created, none is touched, and the answer
+    describes only the id it was given.
+
+    Args:
+        progress_id: Identifier returned by a tracked tool.
+
+    Returns:
+        dict: The snapshot with ``found`` true, or a not-found response.
+    """
+    snapshot = _snapshot(progress_id)
+
+    if snapshot is None:
+        return _not_found(progress_id)
+
+    return {**snapshot, "found": True}
+
+
+def read_result(progress_id: str) -> dict:
+    """Hand over a finished benchmark's measurements.
+
+    Args:
+        progress_id: Identifier returned by a benchmark tool.
+
+    Returns:
+        dict: The measurements, or an explanation of why there are none yet.
+    """
+    snapshot = _snapshot(progress_id)
+
+    if snapshot is None:
+        return _not_found(progress_id)
+
+    job = registry.get(progress_id)
+    result = job.result() if job is not None else store.load_result(progress_id)
+
+    if result is None:
+        return {
+            "id": progress_id,
+            "found": True,
+            "status": snapshot.get("status"),
+            "result_available": False,
+            "message": _no_result_reason(snapshot),
+        }
+
+    return {
+        "id": progress_id,
+        "found": True,
+        "status": snapshot.get("status"),
+        "result_available": True,
+        "result": result,
+    }
+
+
+def _no_result_reason(snapshot: dict) -> str:
+    """Explain why a job has no measurements to hand over.
+
+    Args:
+        snapshot: The job's current snapshot.
+
+    Returns:
+        str: The reason, phrased for the model.
+    """
+    status = snapshot.get("status")
+
+    if status in ("starting", "running"):
+        return (
+            "This benchmark is still running. Poll progress_get_status with this "
+            "progress_id until its status is completed, then call this again."
         )
 
-        if job is None:
-            snapshot = _untracked(progress_id)
-            snapshot["title"] = "Nothing to stop"
-            snapshot["subtitle"] = (
-                "That operation is not running; nothing was changed."
-            )
-            snapshot["pause_action"] = "unavailable"
-            return snapshot
+    if status == "failed":
+        return (
+            f"This benchmark failed, so it produced no measurements: "
+            f"{snapshot.get('error') or 'no error was recorded'}."
+        )
 
-        return tracking.pause_job(job)
+    if status == "cancelled":
+        return "This benchmark was cancelled, so it produced no measurements."
+
+    return "No measurements were recorded for this operation."
 
 
-def register_download_tools(
-    apps: Apps,
-    get_session: Callable[[str], Any],
-    release_session: Callable[[str], Any] | None = None,
-) -> None:
-    """Register the download start tool that shows the panel.
+CANCEL_DESCRIPTION = (
+    "Cancel the operation with this progress_id and undo what it had done. "
+    "The download or benchmark stops at its next safe point, core removes "
+    "everything it created — partial and completed downloads, a loaded "
+    "model — and records a cancelled entry in the execution log. For a "
+    "download the session is removed too, so downloading the same files "
+    "again means creating it fresh. Cannot be undone; to suspend a download "
+    "and keep it, use progress_pause. Reports cancel_requested=false when "
+    "the operation was not running."
+)
+
+PAUSE_DESCRIPTION = (
+    "Stop the download with this progress_id without cancelling it, or "
+    "resume one that was stopped. The queue, the files already fetched and "
+    "the partial data are kept, and resuming continues the active file from "
+    "where it left off via an HTTP range request. Downloads only: a "
+    "benchmark reports pause_action='unavailable' rather than being "
+    "cancelled."
+)
+
+
+def cancel_operation(progress_id: str) -> dict:
+    """End one operation and have core undo what it did.
+
+    Args:
+        progress_id: Identifier returned by a tracked tool.
+
+    Returns:
+        dict: Final snapshot after the cleanup, or the stored record when the
+        operation was not running.
+    """
+    job = registry.get(progress_id)
+
+    if job is None:
+        return _inert(progress_id, "cancel_requested", False)
+
+    return workers.cancel(job)
+
+
+def pause_operation(progress_id: str) -> dict:
+    """Suspend one download, or continue a suspended one.
+
+    Cancel and Stop are different operations. Cancel ends the task and has core
+    undo it, and applies to both kinds. Stop only suspends a download and leaves the
+    task intact, so it exists for downloads alone — they are the only operation core
+    can pause and resume.
+
+    Args:
+        progress_id: Identifier returned by a tracked tool.
+
+    Returns:
+        dict: Snapshot afterwards, with ``pause_action``.
+    """
+    job = registry.get(progress_id)
+
+    if job is None:
+        return _inert(progress_id, "pause_action", "unavailable")
+
+    return workers.pause(job)
+
+
+def _register_panel_tools(apps: Apps) -> None:
+    """Register the tools the panel itself calls over its bridge.
+
+    These are the only read-and-control tools bound to the panel, and they are
+    ``visibility=["app"]``: the view calls them, the model does not see them, and a
+    call the view makes is answered back into its iframe rather than added to the
+    conversation. That is what lets the panel poll twice a second without the
+    conversation growing a progress bar per poll.
+
+    They are named apart from the model's tools so the two surfaces cannot be
+    confused, and each is a one-line delegation to the same function the model's
+    equivalent calls.
+
+    Args:
+        apps: Extension the tools are added to.
+    """
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        visibility=["app"],
+        name="progress_panel_status",
+        title="Read progress for the panel",
+        description=(
+            "Internal: the progress panel's own poll for the operation it is "
+            "rendering. Returns the same snapshot as progress_get_status."
+        ),
+        annotations=ToolAnnotations(
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=False,
+        ),
+    )
+    @surface_core_errors
+    def progress_panel_status(progress_id: str) -> dict:
+        """Return one job's snapshot, for the panel.
+
+        Args:
+            progress_id: Identifier the panel adopted from its tool result.
+
+        Returns:
+            dict: The snapshot, or a not-found response.
+        """
+        return read_status(progress_id)
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        visibility=["app"],
+        name="progress_panel_cancel",
+        title="Cancel from the panel",
+        description=f"Internal: the panel's Cancel button. {CANCEL_DESCRIPTION}",
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=True,
+            idempotent_hint=True,
+            open_world_hint=False,
+        ),
+    )
+    @surface_core_errors
+    def progress_panel_cancel(progress_id: str) -> dict:
+        """Cancel one operation from the panel.
+
+        Args:
+            progress_id: Identifier the panel adopted from its tool result.
+
+        Returns:
+            dict: Final snapshot after the cleanup.
+        """
+        return cancel_operation(progress_id)
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        visibility=["app"],
+        name="progress_panel_pause",
+        title="Stop or resume from the panel",
+        description=f"Internal: the panel's Stop button. {PAUSE_DESCRIPTION}",
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=False,
+        ),
+    )
+    @surface_core_errors
+    def progress_panel_pause(progress_id: str) -> dict:
+        """Suspend or continue one download from the panel.
+
+        Args:
+            progress_id: Identifier the panel adopted from its tool result.
+
+        Returns:
+            dict: Snapshot afterwards, with ``pause_action``.
+        """
+        return pause_operation(progress_id)
+
+
+def _inert(progress_id: str, field: str, value: Any) -> dict:
+    """Build the answer for a control aimed at an operation that is not running.
+
+    The stored record is returned when there is one, so the caller learns how the
+    operation ended rather than only that it is not running now.
+
+    Args:
+        progress_id: Identifier that was asked for.
+        field: Outcome field the calling tool documents.
+        value: Value marking the request as having had no effect.
+
+    Returns:
+        dict: Snapshot or not-found response, with the outcome field set.
+    """
+    record = store.load(progress_id)
+
+    if record is None:
+        return {**_not_found(progress_id), field: value}
+
+    return {
+        **record,
+        "found": True,
+        field: value,
+        "message": (
+            f"{record.get('message') or 'Already finished'} — nothing was changed."
+        ),
+    }
+
+
+def _started(job: Job, **extra: Any) -> dict:
+    """Build a tracked tool's return value.
+
+    ``progress_id`` comes first and is the only thing the panel needs; the rest
+    tells the model what it has been given and what it still owes.
+
+    Args:
+        job: Job that was started.
+        extra: Additional fields for the model.
+
+    Returns:
+        dict: Tool result carrying the identifier.
+    """
+    return {"progress_id": job.id, "status": job.snapshot()["status"], **extra}
+
+
+BENCHMARK_CONTRACT = (
+    "This benchmark has started and has NOT completed. This response is an "
+    "acknowledgement, not the benchmark result, and it contains no measurements. "
+    "Poll progress_get_status with this progress_id until its status is "
+    "'completed', 'failed' or 'cancelled'. On 'completed', call "
+    "benchmark_get_result with the same progress_id to obtain the measurements, "
+    "and use those to answer the user. Do not report the benchmark as done, and do "
+    "not describe its results, before retrieving them."
+)
+
+
+def _benchmark_started(job: Job, **extra: Any) -> dict:
+    """Build a benchmark tool's return value.
+
+    Args:
+        job: Job that was started.
+        extra: Additional fields for the model.
+
+    Returns:
+        dict: Handle plus the contract the model has to follow.
+    """
+    return {
+        **_started(job, **extra),
+        "result_available": False,
+        "next_step": (
+            f"Poll progress_get_status(progress_id='{job.id}') until it reports a "
+            f"terminal status, then call "
+            f"benchmark_get_result(progress_id='{job.id}')."
+        ),
+        "contract": BENCHMARK_CONTRACT,
+    }
+
+
+def _register_download(apps: Apps, get_session: Callable[[str], Any]) -> None:
+    """Register the download tool bound to the panel.
 
     Args:
         apps: Extension the tool is added to.
         get_session: Resolver for a download session id.
-        release_session: Called with the session id once its queue has stopped.
     """
 
     @apps.tool(
@@ -336,96 +644,59 @@ def register_download_tools(
         name="download_start_with_progress",
         title="Start downloading with a progress bar",
         description=(
-            "Start processing a session's queue and show a live progress bar in "
-            "the conversation: per-file bars with transferred and total bytes and "
-            "an overall percentage. Returns immediately, like "
-            "download_start; the panel keeps updating while the background "
-            "thread works. Queue every file first, and prefer this over "
-            "download_start whenever a human is watching. Calling it again for a "
-            "session that is already downloading is rejected rather than starting "
-            "a second transfer of the same files."
+            "Start processing a session's queue and show a live progress bar in the "
+            "conversation: per-file bars with transferred and total bytes and an "
+            "overall percentage. Returns immediately with a progress_id, and the "
+            "transfer continues in the background — starting it is the whole of this "
+            "tool's job, so there is no result to collect afterwards. Carry on with "
+            "other work and call progress_get_status with the id whenever the "
+            "outcome matters, or to confirm the files arrived. Queue every file "
+            "first, and prefer this over download_start whenever a human is "
+            "watching."
         ),
         annotations=LONG_RUNNING,
     )
     @surface_core_errors
     def download_start_with_progress(session_id: str) -> dict:
-        """Start a session's queue with progress reporting.
+        """Start a session's queue with a progress bar.
 
         Args:
             session_id: Session created by download_create_session.
 
         Returns:
-            dict: Session status just after starting, plus the ``progress_id``
-            the panel polls.
+            dict: The ``progress_id`` and the session's status just after starting.
 
         Raises:
-            ToolError: If this session is already downloading under another
-                progress bar.
+            ToolError: If this session is already downloading.
         """
         manager = get_session(session_id)
+        running = registry.find_download(session_id)
 
-        try:
-            job = tracking.track_download(
-                manager,
-                session_id=session_id,
-                on_finished=_release_when_cancelled(
-                    session_id, manager, release_session
-                ),
-            )
-        except DuplicateJob as duplicate:
-            # A second bar over one queue would offer two Cancel buttons for the
-            # same work, and the first to be pressed would delete the files the
-            # other was still reporting progress for.
+        if running is not None:
+            # Two bars over one queue would each offer a Cancel button for the same
+            # work, and the first pressed would delete the files the other was
+            # still reporting.
             raise ToolError(
-                f"Download session '{session_id}' is already being downloaded "
-                f"and tracked as {duplicate.job.progress_id}. Poll that "
-                f"progress bar, or cancel it before starting again."
-            ) from duplicate
+                f"Download session '{session_id}' is already downloading as "
+                f"{running.id}. Poll that progress bar, or cancel it before "
+                f"starting again."
+            )
 
-        return {
-            "progress_id": job.progress_id,
-            "status": manager.get_status(),
-        }
+        job = workers.start_download(manager, session_id)
 
-
-def _release_when_cancelled(
-    session_id: str,
-    manager: Any,
-    release_session: Callable[[str], Any] | None,
-) -> Callable[[str], None] | None:
-    """Build the watcher's completion hook for one download session.
-
-    A cancelled session is closed: its queue is gone and the files it fetched
-    have been deleted, so it is dropped from the owning registry and its id
-    becomes free again. A session that finished normally is left registered —
-    its status is still worth reading, and nothing about it is stale.
-
-    Args:
-        session_id: Session the hook belongs to.
-        manager: Manager being watched.
-        release_session: Remover supplied by the owning layer, if any.
-
-    Returns:
-        Callable[[str], None] | None: Hook for ``track_download``, or None when
-        no remover was supplied.
-    """
-    if release_session is None:
-        return None
-
-    def on_finished(finished_id: str) -> None:
-        try:
-            closed = manager.get_status()["closed"]
-        except Exception:  # pragma: no cover - defensive
-            closed = True
-
-        if closed:
-            release_session(finished_id)
-
-    return on_finished
+        return _started(
+            job,
+            session_id=session_id,
+            note=(
+                "The download is running in the background. No result needs to be "
+                "collected; poll progress_get_status with this progress_id when the "
+                "outcome matters."
+            ),
+        )
 
 
-def register_benchmark_tools(apps: Apps) -> None:
-    """Register the benchmarking tools that show the panel.
+def _register_benchmarks(apps: Apps) -> None:
+    """Register the benchmarking tools bound to the panel.
 
     Args:
         apps: Extension the tools are added to.
@@ -434,13 +705,20 @@ def register_benchmark_tools(apps: Apps) -> None:
     @apps.tool(
         resource_uri=PROGRESS_URI,
         name="ollama_run_test_with_progress",
-        title="Benchmark one configuration with a progress bar",
+        title="Start benchmarking one configuration, with a progress bar",
         description=(
-            "Run a set of prompts against one model with temporary generation "
-            "parameters and show a live progress bar in the conversation, one "
-            "row per prompt with its tokens-per-second as it finishes. Returns "
-            "the same measurements as ollama_run_test. Long-running: each prompt "
-            "is a full generation, which is why the panel is worth showing."
+            "Start a benchmark of one model under one set of generation parameters, "
+            "running it in the background and showing a live progress bar in the "
+            "conversation with one row per prompt. Returns immediately with a "
+            "progress_id — an acknowledgement that the benchmark has started, NOT "
+            "its results, which do not exist yet. Poll progress_get_status with "
+            "that id until the status is 'completed', 'failed' or 'cancelled', then "
+            "call benchmark_get_result with the same id to obtain the measurements. "
+            "The benchmark is not finished, and its results cannot be reported, "
+            "until that retrieval. Prefer this whenever a human is watching, since "
+            "each prompt is a full generation; use the synchronous ollama_run_test "
+            "when the measurements are wanted in one call and no progress bar is "
+            "needed."
         ),
         annotations=LONG_RUNNING,
     )
@@ -452,7 +730,7 @@ def register_benchmark_tools(apps: Apps) -> None:
         name: str = "test",
         include_output: bool = False,
     ) -> dict:
-        """Benchmark a model under a single configuration, with progress.
+        """Start a benchmark of one configuration.
 
         Args:
             model_name: Model name or tag to benchmark.
@@ -460,43 +738,38 @@ def register_benchmark_tools(apps: Apps) -> None:
             config: Optional generation options, for example
                 {"temperature": 0.7, "num_ctx": 4096}.
             name: Label recorded with the results.
-            include_output: Whether to include generated text alongside metrics.
+            include_output: Whether to keep generated text alongside metrics.
 
         Returns:
-            dict: Per-prompt results and summary, plus the ``progress_id``.
-
-        Raises:
-            ToolError: If the same model and label are already being benchmarked
-                under another progress bar.
+            dict: The ``progress_id`` to poll, and the contract to follow.
         """
-        try:
-            result, job = tracking.run_test_tracked(
-                model=model_name,
-                prompts=prompts,
-                config=config,
-                name=name,
-                include_output=include_output,
-            )
-        except DuplicateJob as duplicate:
-            raise ToolError(
-                f"'{model_name}' is already being benchmarked under the label "
-                f"'{name}', tracked as {duplicate.job.progress_id}. Use a "
-                f"different name, or cancel that run first."
-            ) from duplicate
+        job = workers.start_benchmark(
+            model=model_name,
+            prompts=prompts,
+            configurations=[{"name": name, "options": dict(config or {})}],
+            include_output=include_output,
+        )
 
-        return {"progress_id": job.progress_id, "result": result}
+        return _benchmark_started(job, model=model_name, prompts=len(prompts))
 
     @apps.tool(
         resource_uri=PROGRESS_URI,
         name="ollama_compare_tests_with_progress",
-        title="Compare configurations with a progress bar",
+        title="Start comparing configurations, with a progress bar",
         description=(
-            "Run the same prompts against one model under several parameter "
-            "configurations and show a live progress bar in the conversation, "
-            "one row per configuration advancing as its prompts complete. "
-            "Returns the same side-by-side results as ollama_compare_tests. "
-            "Long-running: total time is the prompt count multiplied by the "
-            "configuration count, so prefer this variant."
+            "Start a comparison of one model under several sets of generation "
+            "parameters, running it in the background and showing a live progress "
+            "bar in the conversation with one row per configuration. Returns "
+            "immediately with a progress_id — an acknowledgement that the "
+            "comparison has started, NOT its results, which do not exist yet. Poll "
+            "progress_get_status with that id until the status is 'completed', "
+            "'failed' or 'cancelled', then call benchmark_get_result with the same "
+            "id to obtain the side-by-side measurements. The comparison is not "
+            "finished, and no configuration can be recommended, until that "
+            "retrieval. Total time is the prompt count multiplied by the "
+            "configuration count, which is why this runs asynchronously; use the "
+            "synchronous ollama_compare_tests when the measurements are wanted in "
+            "one call."
         ),
         annotations=LONG_RUNNING,
     )
@@ -507,35 +780,72 @@ def register_benchmark_tools(apps: Apps) -> None:
         configurations: list[dict],
         include_output: bool = False,
     ) -> dict:
-        """Compare a model across configurations, with progress.
+        """Start a comparison across configurations.
 
         Args:
             model_name: Model name or tag to benchmark.
             prompts: Prompts run against every configuration.
             configurations: Configurations to compare, each shaped as
                 {"name": "warm", "options": {"temperature": 0.9}}.
-            include_output: Whether to include generated text alongside metrics.
+            include_output: Whether to keep generated text alongside metrics.
 
         Returns:
-            dict: One benchmark result per configuration, plus the
-            ``progress_id``.
+            dict: The ``progress_id`` to poll, and the contract to follow.
 
         Raises:
-            ToolError: If this model is already being compared under another
-                progress bar.
+            ToolError: If no configuration was given, or one is malformed. Checked
+                here because the worker runs after this returns, so a bad argument
+                would otherwise surface only on the progress bar.
         """
-        try:
-            result, job = tracking.compare_tests_tracked(
-                model=model_name,
-                prompts=prompts,
-                configurations=configurations,
-                include_output=include_output,
-            )
-        except DuplicateJob as duplicate:
-            raise ToolError(
-                f"'{model_name}' is already being compared, tracked as "
-                f"{duplicate.job.progress_id}. Wait for that run or cancel it "
-                f"before starting another."
-            ) from duplicate
+        job = workers.start_benchmark(
+            model=model_name,
+            prompts=prompts,
+            configurations=_normalise(configurations),
+            include_output=include_output,
+        )
 
-        return {"progress_id": job.progress_id, "result": result}
+        return _benchmark_started(
+            job,
+            model=model_name,
+            configurations=len(configurations),
+        )
+
+
+def _normalise(configurations: list[dict]) -> list[dict]:
+    """Validate and name the configurations before the worker starts.
+
+    Core normalises these itself, but it does so on the worker thread — after the
+    tool has returned. Doing it here means a malformed configuration is a tool
+    error the model can act on, and the row names are known before core runs.
+
+    Args:
+        configurations: Configurations as given to the tool.
+
+    Returns:
+        list[dict]: One ``{"name", "options"}`` per configuration.
+
+    Raises:
+        ToolError: If the list is empty or an entry is not usable.
+    """
+    if not configurations:
+        raise ToolError("At least one configuration is required.")
+
+    normalised = []
+
+    for position, configuration in enumerate(configurations, start=1):
+        if not isinstance(configuration, dict):
+            raise ToolError(f"Configuration {position} must be an object.")
+
+        options = configuration.get("options", {})
+
+        if not isinstance(options, dict):
+            raise ToolError(f"Configuration {position} options must be an object.")
+
+        normalised.append(
+            {
+                "name": str(configuration.get("name") or f"configuration_{position}"),
+                "options": options,
+            }
+        )
+
+    return normalised

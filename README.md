@@ -13,8 +13,9 @@ job bookkeeping behind it.
 ├── gui/               # the in-chat progress panel
 │   ├── __init__.py
 │   ├── app.py         # MCP Apps extension: ui:// resource + bound tools
-│   ├── tracking.py    # runs core operations, publishes progress, wires stopping
-│   ├── jobs.py        # job model and registry
+│   ├── jobs.py        # job model and the registry of jobs running now
+│   ├── store.py       # persisted snapshots — the source of truth
+│   ├── workers.py     # threads that run the operations and update their jobs
 │   ├── logtail.py     # incremental reader for core's execution log
 │   ├── loader.py      # inlines the assets into one HTML document
 │   └── assets/
@@ -74,7 +75,7 @@ The server speaks JSON-RPC over stdio. Client configuration:
 
 ## Tools
 
-54 tools. 48 are thin pass-throughs to core, grouped by area below; the other 6
+58 tools. 48 are thin pass-throughs to core, grouped by area below; the other 10
 belong to the progress panel and are documented in [Progress panel](#progress-panel).
 Names are prefixed by area, and each carries MCP annotations so a client can tell
 a read-only call from a destructive one.
@@ -108,11 +109,15 @@ The two log tools read Ollama's own log files — the live `app.log` and
 reads this project's execution log. They work as a pair: `list_ollama_logs`
 returns a `{file name: size in bytes}` dict, alongside per-file paths and
 modification times, and `read_ollama_logs` takes one of those names and returns
-that file in full. Splitting it that way keeps the caller from pulling megabytes
+that file. Splitting it that way keeps the caller from pulling megabytes
 it did not ask for, and the sizes are what make the choice informed —
 `server.log` alone routinely passes a megabyte, and it is the one file that says
 why a service start or model load failed. `read_ollama_logs` accepts a bare file
-name only, so a path cannot reach outside the log directories.
+name only, so a path cannot reach outside the log directories, and it returns
+the whole file by default unless `start_line` and `end_line` (1-based and
+inclusive, `end_line` optional to read through the end) select a window of
+lines instead; the response reports `total_lines` so a caller can page through
+a large file.
 
 ### Ollama models — `core.ollama.model`
 
@@ -210,15 +215,15 @@ inject arbitrary records would pollute the execution history.
 
 ## Progress panel
 
-Anything slow — downloads, installers, benchmarks — has a `_with_progress`
-variant that renders a live progress bar in the conversation itself, next to the
-assistant's message, with a red **Cancel** button in its top-right corner and,
-for downloads, a **Stop** button beside it. Everything for it lives in `gui/`;
-`main.py` only imports `create_progress_app` and passes it to
-`MCPServer(extensions=[...])`.
+Downloads and benchmarks have a `_with_progress` variant that renders a live
+progress bar in the conversation itself, next to the assistant's message, with a
+red **Cancel** button in its top-right corner and, for downloads, a **Stop**
+button beside it. Everything for it lives in `gui/`; `main.py` imports
+`create_progress_app` and passes it to `MCPServer(extensions=[...])`, and calls
+`register_progress_tools` alongside its own registrars.
 
-`system_scan` has no progress variant. It takes a few seconds and has nothing
-worth watching, so the bar was not carrying its weight there.
+Installations and `system_scan` have no progress variant. They have nothing
+measurable to report, so the bar was not carrying its weight there.
 
 ### How it reaches the chat
 
@@ -226,8 +231,8 @@ The panel is an [MCP Apps](https://modelcontextprotocol.io) extension
 (`io.modelcontextprotocol/ui`), which the SDK ships as `mcp.server.apps`. A tool
 advertises `_meta.ui.resourceUri` pointing at a `ui://` HTML resource, and the
 client renders that resource in a sandboxed iframe inline in the conversation.
-The extension is purely additive: it contributes one resource and six tools,
-and intercepts nothing.
+The extension is purely additive: it contributes one resource and six tools, and
+intercepts nothing.
 
 An app resource is a single self-contained HTML document — the iframe has no
 origin to fetch siblings from — so `gui/loader.py` inlines `progress.css` and
@@ -244,82 +249,86 @@ every text colour here is checked against the surface it actually sits on and
 clears the WCAG AA 4.5:1 threshold in both themes. Fonts and corner radii still
 follow the host, since those cannot hurt legibility.
 
+### One operation, one progress bar
+
+The binding that draws a panel is what decides which tools may have one, because
+**a client renders a panel for every tool result whose tool advertises the
+resource**. So only the three tools that *start* an operation are bound to it —
+one call, one job, one bar — and everything that merely reads or controls a job
+that already exists is a plain tool with no UI of its own, registered by
+`register_progress_tools` on the server rather than on the extension.
+
+That split is the fix for the duplicate bars. `progress_get_status` used to be
+bound to the panel, so every poll the model made rendered another one; each new
+bar had no id of its own to poll and sat at "starting" for ever while the real
+bar, the one belonging to the starting call, ran to completion. Two surfaces now
+exist over one implementation:
+
+| Surface | Tools | Bound to the panel |
+| --- | --- | --- |
+| The model | `progress_get_status`, `benchmark_get_result`, `progress_cancel`, `progress_pause` | No — polling draws nothing |
+| The panel | `progress_panel_status`, `progress_panel_cancel`, `progress_panel_pause` | Yes, `visibility=["app"]` |
+
+The panel's own tools are app-visible only: the view calls them over the
+postMessage bridge, the model never sees them, and a call the view makes is
+answered back into its iframe instead of being added to the conversation. That is
+what lets the panel poll twice a second without the conversation growing a bar per
+poll. Both surfaces call the same four functions in `gui/app.py`, so the model and
+the view can never disagree about a job.
+
+A poll is a read and nothing else. It creates no job, touches none, and answers
+only for the id it was given: the running job when there is one, its persisted
+record otherwise. There is no search, no fallback and no "newest job" guess, so a
+request for one run can never be answered with another, and an unknown id reports
+`found: false` rather than somebody else's progress. A snapshot names itself with
+`id`, never `progress_id`, so a status result replayed at the view cannot be
+mistaken for a starting call.
+
+The view is deliberately dumb. It learns one `progress_id` from its own tool
+result, polls with that id, and draws what comes back; the first id it adopts is
+its own for good, so a later result naming a different operation is not that bar's
+business. Only a snapshot whose status is `completed`, `failed` or `cancelled`
+stops the polling — a timeout, a missing snapshot or a slow server means retry,
+never "ended". A view that is never handed an operation at all polls nothing (it
+has no id to poll with) and, after a few seconds, says so plainly instead of
+animating "Starting…" indefinitely; a result arriving later — an approval prompt
+can hold a call for minutes — is still adopted.
+
 ### How progress gets out while a tool is still running
 
-The panel polls `progress_get_status` over the Apps postMessage bridge. That
-works because the SDK dispatches each request on its own task and runs a sync
-tool function on a worker thread, so a status poll is answered while the tool
-call that owns the operation is still blocked inside core.
+Nothing has to. A starting tool creates its job, hands the work to a background
+thread, and returns the `progress_id` within milliseconds, so the MCP request is
+never held open for the length of the operation. The worker updates the job as it
+goes, `gui/store.py` persists every snapshot, and both surfaces read that state
+whenever they are asked. `gui/jobs.py`'s registry is a runtime cache over the
+store, not a second source of truth: it exists so a Cancel button has an object to
+call and so a reader mid-operation is not served a snapshot half a second old.
+Because the record is written before the starting tool returns, a poll arriving
+before the operation has really begun already finds a real snapshot.
 
-### State isolation: which job a panel shows
-
-This is the part of the design that needed the most care, because two facts about
-the environment work against the obvious implementation. The server is **one
-process shared by every conversation** — there is no per-chat scope to hang state
-on. And a panel is **part of a conversation's record**: a host that re-renders a
-stored one replays the tool input and result it was created with, so an identifier
-can arrive naming an operation that finished long ago, in a chat that is no longer
-open.
-
-On top of that, the host renders a panel as soon as its tool call is *issued* —
-before the call has reached the server and created its job — so the panel's first
-polls carry no identifier at all and something has to decide what they mean.
-
-Answering those with "the newest job" is what leaked. During that opening window
-the newest job is the *previous* task's, so a panel adopted a finished operation,
-drew its final state, and — the state being terminal — stopped polling and never
-saw the job it was opened for. Four rules replace that guess, and each closes a
-different path:
-
-1. **A finished job is not retained.** Once an operation ends, the panel showing it
-   has already drawn its last frame, so the server's copy has no further reader. It
-   is kept for `FINISHED_GRACE_SECONDS` — enough for an in-flight poll and the
-   tool's own result to land — and then dropped. Nothing stale is left to serve.
-2. **Identifiers are unguessable and namespaced per process.** Each is
-   `progress-<instance>-<random>`, the instance minted at startup. An id from an
-   earlier run of the server is refused outright instead of colliding with a
-   current job — which sequential `progress-1` ids made not merely possible but
-   likely across a restart.
-3. **A job is claimable only briefly, and only once.** An id-less poll is answered
-   with a job that is running, unclaimed, *and* seconds old, because a panel polls
-   within milliseconds of opening. A download that was already underway when the
-   panel opened belongs to another conversation and is never handed over. Asking by
-   id claims the job too, so a pinned panel's job is not offered to the next panel.
-4. **The panel refuses a finished job it did not ask for.** Until its own tool
-   result confirms the pin, a snapshot in a terminal state cannot belong to a panel
-   that has only just opened, so it is ignored rather than drawn — a backstop that
-   holds even if the server offers one.
-
-The panel keeps its end of it. Once a snapshot arrives it pins to that
-`progress_id` and names it in every later poll, so it stays on its own job as newer
-ones start. When its tool call returns, the `progress_id` in the result is
-authoritative and overrides an earlier guess; if it names a different job, the bar,
-badge, buttons, metrics and step rows are all cleared before the new one is drawn,
-so no fragment of one task appears under another's title. A snapshot for any other
-job is dropped rather than rendered.
+Snapshots survive the process. A finished run is read back from its record, so
+polling after the run ended — or after the server restarts — still answers, and
+`gui/store.py` prunes records older than a week and keeps at most 200.
 
 ### Reopening a conversation
 
-A restored panel has no job to poll: the tool call it belongs to ran in the past
-and is not running again, so the server will never create one. Left alone the panel
-sits on "Starting…" indefinitely, waiting for something that is not coming.
+A restored panel takes the same path as a live one. The host replays the starting
+tool's result, the view adopts the same `progress_id`, and the poll answers from
+the persisted record: the bar draws its final state and stops. There is no
+separate restoration path, and nothing is guessed, so a reopened conversation can
+never adopt whatever happens to be running now.
 
-So a panel gives up after `STARTUP_GRACE_MS` — a live operation's job exists within
-a few hundred milliseconds of the panel opening, so anything past a few seconds is
-a restored panel — and then rebuilds a final frame from the tool result the host
-replays alongside it. That result carries the operation's own outcome: the per-prompt
-rates of a benchmark, the per-configuration averages of a comparison, the queue of a
-download. The bar fills, the rows show what each step produced, and the subtitle says
-it finished earlier in the conversation. Nothing is read from the server, so nothing
-can be borrowed from another task.
+### A benchmark's measurements are fetched, not polled
 
-When there is no result to rebuild from — a panel whose tool errored, say — it says
-"Progress no longer available" with an empty bar instead. Either way the panel shows
-its *own* operation or nothing, never whatever happens to be running now.
-
-`progress_cancel` and `progress_pause` called without an id act on the newest
-operation still *running*, which is what the model means by "cancel the download"
-and the only thing that can still have an effect.
+A download is fire-and-monitor: starting the transfer is the whole of the tool's
+job, so there is nothing to collect afterwards. A benchmark is asked for
+measurements, and its starting call cannot deliver them — it returns an
+acknowledgement carrying a `progress_id`, with `result_available: false` and the
+contract spelled out in the response. The measurements are written to
+`Core/data/progress/results/` when the run finishes and handed over by
+`benchmark_get_result`, which is why they are not repeated in a snapshot polled
+several times a second: a comparison result is far larger than the progress around
+it.
 
 All of this lives in `gui/`; `core` is untouched by it.
 
@@ -327,9 +336,8 @@ What each kind of operation reports is whatever core already exposes:
 
 | Operation | Progress source |
 | --- | --- |
-| Downloads | `DownloadManager.get_status`, polled on a watcher thread. `download_start_with_progress` returns as soon as the queue starts, like `download_start`, and the watcher keeps the panel current until the transfer ends. |
-| Benchmarks | Core logs an entry per prompt, so `gui/logtail.py` tails the execution log while `experiment.run_test` / `compare_tests` run. For a comparison, the step names come from the normalised configuration list core logs when it starts. |
-| Installers and package installs | Nothing measurable to report, so the bar stays indeterminate and the panel tracks which step is active. |
+| Downloads | `DownloadManager.get_status`, polled on a worker thread. `download_start_with_progress` returns as soon as the queue starts, like `download_start`, and the worker keeps the job current until the transfer ends. |
+| Benchmarks | Core logs an entry per prompt, so `gui/logtail.py` tails the execution log while `experiment.compare_tests` runs. For a comparison, the step names are the normalised configuration names. |
 
 `gui/logtail.py` exists because `core.logging.read_logs` re-parses the whole file
 per call, which is fine for a query but not for polling several times a second.
@@ -337,15 +345,18 @@ It keeps a byte offset, parses only what was appended, and holds back a trailing
 fragment so a read landing mid-write is not lost.
 
 The log is a best-effort source of *live* progress, not the authority on the final
-state. Core writes a prompt's entry immediately before returning, so the watcher's
+state. Core writes a prompt's entry immediately before returning, so the reader's
 last read routinely misses it, and a prompt that failed before core got as far as
 logging produces no entry at all. Either way a row would be left reading "waiting"
-under a job the panel had already marked complete — which is what left the last
-configuration of a comparison stuck on "waiting". So when a benchmark or comparison
-returns, its watcher is stopped, joined, and every row is then closed from the
-returned result: one entry per prompt for a run, matched by configuration name for
-a comparison. A comparison short enough that the watcher never saw the entry its
-rows are built from has them built from the result instead.
+under a job already marked complete — which is what left the last configuration of
+a comparison stuck on "waiting". So when a benchmark returns, its reader is
+stopped, joined, and every row is then closed from the returned result, which is
+authoritative.
+
+Core also records a failed prompt as a result entry rather than raising, so a run
+against a model that does not exist returns *normally* with every prompt failed.
+Classifying the result is what turns that into a `failed` job rather than a
+`completed` one with no measurements.
 
 The panel shows no clock. `elapsed_seconds` is still in the snapshot, because
 `progress_cancel` hands that snapshot to the model and how long an operation ran
@@ -355,43 +366,37 @@ ticking readout under them was noise.
 
 ### The tools
 
-| Tool | Wraps | Progress shown |
-| --- | --- | --- |
-| `download_start_with_progress` | `DownloadManager.start` | Per-file bars, bytes, overall percentage |
-| `ollama_run_test_with_progress` | `experiment.run_test` | One row per prompt with its tokens per second |
-| `ollama_compare_tests_with_progress` | `experiment.compare_tests` | One row per configuration, advancing per prompt |
-| `progress_get_status` | — | The panel's own poll target |
-| `progress_cancel` | — | The Cancel button's target |
-| `progress_pause` | — | The Stop button's target (downloads only) |
+| Tool | Wraps | Panel | Progress shown |
+| --- | --- | --- | --- |
+| `download_start_with_progress` | `DownloadManager.start` | draws it | Per-file bars, bytes, overall percentage |
+| `ollama_run_test_with_progress` | `experiment.compare_tests` | draws it | One row per prompt |
+| `ollama_compare_tests_with_progress` | `experiment.compare_tests` | draws it | One row per configuration, advancing per prompt |
+| `progress_get_status` | — | none | What the model polls |
+| `benchmark_get_result` | — | none | Where a benchmark's measurements come from |
+| `progress_cancel` | — | none | Cancel, by id |
+| `progress_pause` | — | none | Stop or resume a download, by id |
+| `progress_panel_status` / `_cancel` / `_pause` | — | app-visible | The view's own poll and buttons |
 
-Each returns the same data as its plain counterpart under a `result` key, plus
-the `progress_id` the panel polls with. `progress_get_status` is marked
-`visibility=["app"]` so it serves the panel without appearing in the model's tool
-list; `progress_cancel` and `progress_pause` stay visible, so the model can act
-on an operation when asked to in words rather than by clicking.
-
-A client that did not negotiate Apps still gets the return value; it just does
-not render the panel. `progress_get_status` answers for the newest operation when
-called without an id, and returns a placeholder rather than failing when nothing
-is tracked.
+A client that did not negotiate Apps still gets every return value; it just does
+not render the panel.
 
 ## Cancelling and stopping
 
 The panel offers two controls, and they do different things.
 
-**Cancel** ends the task and undoes it. It applies to all three long-running
-operations — download, benchmark, installation — and behaves identically for each:
-the operation stops at its next safe point, core removes everything it created,
-and the requirement it is built around is that a cancelled operation leaves **no
-trace but the log entry**. It cannot be undone.
+**Cancel** ends the task and undoes it. It applies to both tracked operations —
+download and benchmark — and behaves identically for each: the operation stops at
+its next safe point, core removes everything it created, and the requirement it is
+built around is that a cancelled operation leaves **no trace but the log entry**.
+It cannot be undone.
 
 **Stop** appears for downloads only and merely suspends the transfer. The queue,
 the files already fetched and the partial data are all kept; pressing it again
 resumes the active file from where it left off via an HTTP range request. It uses
 `DownloadManager.pause` / `resume`, which core already had — nothing new was
-written for it. Benchmarks and installations have no equivalent, so no Stop button
-is shown for them, and calling `progress_pause` on one reports `unavailable`
-rather than cancelling it by surprise.
+written for it. Benchmarks have no equivalent, so no Stop button is shown for them,
+and calling `progress_pause` on one reports `unavailable` rather than cancelling it
+by surprise.
 
 The two are styled to match that difference: Cancel is filled red, Stop is a
 quiet outlined button. Side by side in the same red, they would invite pressing
@@ -411,12 +416,11 @@ with a watcher: on cancellation it terminates the child's *whole process tree*
 usually a launcher and killing only the launcher leaves the real work running.
 
 The panel's side is in `gui/jobs.py`: a job holds a canceller — the token's
-`cancel` for benchmarks and installers, `DownloadManager.cancel` for downloads —
-so the request travels from the panel's tool call to whichever thread is working.
-A Cancel pressed before the operation registered its canceller is not dropped; it
-is applied as soon as one arrives. `progress_cancel` waits for the cleanup to
-finish before returning, so its result describes what actually happened rather
-than what was requested.
+`cancel` for a benchmark, `DownloadManager.cancel` for a download — so the request
+travels from the tool call to whichever thread is working. A Cancel pressed before
+the operation registered its canceller is not dropped; it is applied as soon as one
+arrives. `progress_cancel` waits for the cleanup to finish before returning, so its
+result describes what actually happened rather than what was requested.
 
 ### What gets cleaned up
 
@@ -425,15 +429,12 @@ than what was requested.
 | Download | Every file the session produced — `.part` files *and* files that had already completed, since the queue is one unit of work that did not finish. Files that were on disk before the session started are kept. The download directory goes too, if this session created it and it ends up empty. |
 | Benchmark | The partial results are discarded, and the model the run loaded is unloaded, so the VRAM it was holding is released. |
 | Comparison | Every finished configuration's results are discarded along with the interrupted one. |
-| Ollama install | The installer's process tree is terminated, and if Ollama was absent beforehand but the interrupted installer had already registered it, the service is stopped and the registered uninstaller is run. An installation that was already there is left alone. |
-| Python install | The process tree is terminated, and any interpreter this run registered is uninstalled with the same installer's `/uninstall`. Interpreters that were already present are untouched. |
-| Package install | Pip is terminated, and every distribution the run added — dependencies included, found by comparing against a snapshot taken before it started — is uninstalled. Packages that were already installed stay. |
 
 Each of those writes one `WARNING` entry naming what it removed, which
-`logs_read` will show. The job record itself is then dropped from the registry,
-so nothing about the cancelled operation survives in memory either. The panel
-keeps its final "cancelled" state on screen because the cancel call's own result
-carries that last snapshot.
+`logs_read` will show. The job is then deregistered, so nothing about the cancelled
+operation is left running in memory. Its record stays on disk in its final
+`cancelled` state, which is what a later poll — or a reopened conversation — reads
+back.
 
 For a download, the session goes too. Core's `cancel` closes the manager — its
 queue is emptied and it refuses `add` and `start` afterwards — and `main.py`
@@ -455,49 +456,73 @@ bookkeeping, not a request to undo the download, so it keeps the files and only
 drops the session. Cancelling a queue that already ran to completion also deletes
 nothing — there is no unfinished work to undo.
 
-### One job per operation
+### One bar per download
 
-Every job carries a key identifying the operation it tracks: the download session
-id, the installer path, the model and label of a benchmark. `JobRegistry.create`
-refuses a second *live* job for a key and raises `DuplicateJob`, which the tools
-surface as a `ToolError` naming the bar already running. Two bars over one
-operation would each offer their own Cancel over the same work, and whichever was
-pressed first would undo what the other was still reporting progress for.
+Starting a session that is already downloading is refused: `download_start_with_progress`
+looks for a live job over that session and raises a `ToolError` naming the bar
+already running. Two bars over one queue would each offer their own Cancel for the
+same work, and whichever was pressed first would delete the files the other was
+still reporting progress for. The session is free again as soon as its job
+finishes, so starting a finished download again is a new task rather than a
+duplicate.
 
-The key is released as soon as the job finishes, so starting a finished operation
-again is a new task rather than a duplicate.
+Benchmarks have no such rule — running the same model twice is a legitimate thing
+to ask for, and the two runs are separate operations with separate ids.
 
-A job that has reached a terminal state also stops accepting updates. Its watcher
-thread may still be draining one last reading, and without that a poll landing
-after a cancellation could reopen a step or overwrite `cancelled` with
-`completed` — leaving the panel claiming a download succeeded after its files were
-deleted. Finishing a job drops its canceller and pause controls too, so a late
-button press cannot call into an operation that has already been cleaned up.
+A job that has reached a terminal state also stops accepting updates. Its log
+reader may still be draining one last entry, and without that a late reading could
+reopen a step or overwrite `cancelled` with `completed` — leaving the bar claiming a
+download succeeded after its files were deleted. Finishing a job drops its canceller
+and pause controls too, so a late button press cannot call into an operation that
+has already been cleaned up.
 
-### Jobs
+### Jobs and the store
 
-`gui/jobs.py` holds the state the panel reads. A job has a state, optional
-weighted steps and metric chips; its percentage is derived from the steps unless a
-caller sets one directly, and `None` means indeterminate. Jobs are written from a
-worker thread and read from whichever thread answers a poll, so each guards its
-fields with a lock and `snapshot()` returns a copy.
+`gui/store.py` is the source of truth: one run is one JSON file under
+`Core/data/progress`, written through a temporary file and an atomic replace, so a
+reader sees either the previous snapshot or the new one and never a partial write.
+A benchmark's measurements go in a second file under `results/`, written once as the
+job finishes, because a comparison result is far larger than the progress around it
+and must not be carried by a poll. Lookup is by exact identifier only — there is no
+search — so a progress request either names a run that exists or it does not.
 
-The registry holds what is running, plus what finished in the last few seconds; it
-never holds a finished job indefinitely, which is what keeps one conversation's
-results out of another's panel (see
-[State isolation](#state-isolation-which-job-a-panel-shows)). Running jobs are
-never dropped, however long they take.
+`gui/jobs.py` holds what the store persists. A job has a status, optional weighted
+steps and metric chips; its percentage is derived from the steps unless a worker
+sets one directly, and `None` means indeterminate. Jobs are mutated from a worker
+thread and read from whichever thread answers a poll, so each guards its fields
+with a lock and `snapshot()` returns a copy. Writes are throttled to twice a second
+while a job runs, since progress arrives far faster than anyone reads it.
+
+`finish` is the single terminal path and is idempotent: the first terminal status
+wins, so a late reading cannot overwrite a cancellation with "completed". It stores
+the result first, then the final snapshot — which is what advertises the result —
+and only then deregisters the job, so a reader never sees `result_available: true`
+with nothing to fetch, nor loses the job between memory and disk.
 
 A job keeps no log of its own. Core already writes an execution log entry for
-everything worth recording, and `logs_read` is how that is read back; the panel's
-transcript duplicated it in a window too small to read comfortably, so it is gone.
+everything worth recording, and `logs_read` is how that is read back.
 
 A cancelling job passes through `cancelling` before `cancelled`: the request has
-been sent but core is still cleaning up. The panel shows that state and holds it,
-since a status poll already in flight when Cancel was pressed still describes a
-running operation and would otherwise flip the badge back to "running". A paused
-download stays `running` in core's own state and is reported with `paused: true`,
-which the panel renders as its own state — the transfer is suspended, not over.
+been sent but core is still cleaning up. The panel shows that as its own badge and
+holds it, since a status poll already in flight when Cancel was pressed still
+describes a running operation and would otherwise flip the badge back to "running".
+A paused download stays `running` in core's own state and is reported with
+`paused: true`, which the panel renders as its own badge — the transfer is
+suspended, not over.
+
+### Tests
+
+`tests/` covers the job, store and worker layers and both tool surfaces against a
+stubbed `mcp`, with each test given its own store directory so nothing is written
+into the real `Core/data/progress`. `tests/test_panel_instances.py` is the
+regression for the duplicate bars specifically: it asserts that exactly the three
+starting tools advertise the panel, that the tools the model polls with do not, and
+that 25 polls of one benchmark yield one id, one record on disk and an empty
+registry.
+
+```bash
+python -m pytest tests -q
+```
 
 ## Error handling
 
