@@ -22,7 +22,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from core.logging import get_execution_log_path
+from core.logging import get_log_file_info
 
 DIRECTORY_NAME = "progress"
 RESULTS_NAME = "results"
@@ -42,7 +42,7 @@ def directory() -> Path:
     Returns:
         Path: ``Core/data/progress``, alongside the execution log core writes.
     """
-    path = get_execution_log_path().parent / DIRECTORY_NAME
+    path = get_log_file_info()["path"].parent / DIRECTORY_NAME
     path.mkdir(parents=True, exist_ok=True)
 
     return path

@@ -75,7 +75,7 @@ The server speaks JSON-RPC over stdio. Client configuration:
 
 ## Tools
 
-58 tools. 48 are thin pass-throughs to core, grouped by area below; the other 10
+59 tools. 49 are thin pass-throughs to core, grouped by area below; the other 10
 belong to the progress panel and are documented in [Progress panel](#progress-panel).
 Names are prefixed by area, and each carries MCP annotations so a client can tell
 a read-only call from a destructive one.
@@ -107,17 +107,20 @@ return `None`.
 The two log tools read Ollama's own log files — the live `app.log` and
 `server.log` plus every rotated copy — and are unrelated to `logs_read`, which
 reads this project's execution log. They work as a pair: `list_ollama_logs`
-returns a `{file name: size in bytes}` dict, alongside per-file paths and
-modification times, and `read_ollama_logs` takes one of those names and returns
-that file. Splitting it that way keeps the caller from pulling megabytes
-it did not ask for, and the sizes are what make the choice informed —
-`server.log` alone routinely passes a megabyte, and it is the one file that says
-why a service start or model load failed. `read_ollama_logs` accepts a bare file
-name only, so a path cannot reach outside the log directories, and it returns
-the whole file by default unless `start_line` and `end_line` (1-based and
-inclusive, `end_line` optional to read through the end) select a window of
-lines instead; the response reports `total_lines` so a caller can page through
-a large file.
+returns one entry per file with its name, path, size in bytes, line count and
+modification time, newest first, and `read_ollama_logs` takes one of those names
+and returns that file. Splitting it that way keeps the caller from pulling
+megabytes it did not ask for, and the size and line count are what make the
+choice informed — `server.log` alone routinely passes a megabyte, and it is the
+one file that says why a service start or model load failed. `read_ollama_logs`
+accepts a bare file name only, so a path cannot reach outside the log
+directories, and it returns the whole file unless `start_line` and `end_line`
+(1-based and inclusive, defaulting to the first and last line) select a window
+instead. The response reports `total_lines` for the whole file alongside the
+`start_line` and `end_line` actually returned — both `null` when the range
+matched nothing, which is what a range starting past the end of the file looks
+like. Because the line count `list_ollama_logs` reports is counted the same way,
+it can be passed straight back as `end_line`.
 
 ### Ollama models — `core.ollama.model`
 
@@ -152,10 +155,14 @@ a large file.
 | `python_install_packages` | `tools.install_packages` |
 | `python_uninstall_packages` | `tools.uninstall_packages` |
 | `python_create_script` | `tools.create_script` |
+| `python_read_script` | `tools.read_script` |
 | `python_edit_script` | `tools.edit_script` |
 | `python_delete_script` | `tools.delete_script` |
 | `python_run_script` | `tools.run_script` |
 | `python_install_python` | `installer.install_python` |
+
+`python_edit_script` is a full overwrite, so `python_read_script` is how the
+current content is retrieved before it is replaced.
 
 ### Downloads — `core.download_manager`
 
@@ -167,7 +174,7 @@ resume, and progress tracking all stay in core.
 
 | Tool | Core member |
 | --- | --- |
-| `download_list_allowed_domains` | `manager.ALLOWED_DOMAINS` |
+| `download_list_allowed_domains` | `sources.ALLOWED_DOMAINS` |
 | `download_create_session` | `DownloadManager(...)` |
 | `download_list_sessions` | `DownloadManager.get_status` (all sessions) |
 | `download_add` | `DownloadManager.add` |
@@ -201,14 +208,27 @@ ones, so no file is fetched twice. It raises `RuntimeError` when every item has
 already run.
 
 Core rejects any host outside its whitelist, so check
-`download_list_allowed_domains` before queueing a URL.
+`download_list_allowed_domains` before queueing a URL. The list itself lives in
+`core/download_manager/sources.py`, which both validation points read — the
+manager when a file is queued and the downloader when the transfer starts — so
+the tool reports it from there rather than through either of them.
+
+`download_get_status` also reports each item's current transfer speed in bytes
+per second, which core measures per file.
 
 ### Logging — `core.logging`
 
 | Tool | Core function |
 | --- | --- |
 | `logs_read` | `read_logs` |
-| `logs_get_path` | `get_execution_log_path` |
+| `logs_get_file_info` | `get_log_file_info` |
+
+`logs_read` takes an optional `line_count` alongside the `level`, `component`
+and `action` filters. The filters decide which entries match; `line_count` caps
+how many of those come back, keeping the newest — the log is appended
+chronologically — while still returning them oldest first. `logs_get_file_info`
+reports the log's path, entry count and size without reading it, which is how
+the size of an uncapped read is known in advance.
 
 `write_log` is not exposed: core writes its own entries, and letting a client
 inject arbitrary records would pollute the execution history.
@@ -336,13 +356,16 @@ What each kind of operation reports is whatever core already exposes:
 
 | Operation | Progress source |
 | --- | --- |
-| Downloads | `DownloadManager.get_status`, polled on a worker thread. `download_start_with_progress` returns as soon as the queue starts, like `download_start`, and the worker keeps the job current until the transfer ends. |
+| Downloads | `DownloadManager.get_status`, polled on a worker thread. Each item carries its own byte counts and transfer speed, so the rows show bytes and rate and the chip under the bar shows whichever file is transferring. `download_start_with_progress` returns as soon as the queue starts, like `download_start`, and the worker keeps the job current until the transfer ends. |
 | Benchmarks | Core logs an entry per prompt, so `gui/logtail.py` tails the execution log while `experiment.compare_tests` runs. For a comparison, the step names are the normalised configuration names. |
 
 `gui/logtail.py` exists because `core.logging.read_logs` re-parses the whole file
 per call, which is fine for a query but not for polling several times a second.
 It keeps a byte offset, parses only what was appended, and holds back a trailing
-fragment so a read landing mid-write is not lost.
+fragment so a read landing mid-write is not lost. It splits a line the way core
+does: only the four leading fields are free of the `" | "` separator, so the
+message and the JSON details are separated by taking the longest trailing
+segment that parses as JSON.
 
 The log is a best-effort source of *live* progress, not the authority on the final
 state. Core writes a prompt's entry immediately before returning, so the reader's
@@ -410,10 +433,15 @@ at every point where it can stop without leaving partial work behind and raises
 `OperationCancelled`. Cancelling is therefore cooperative, and each operation
 cleans up on its way out.
 
-A subprocess cannot be stopped by checking a flag, so `run_cancellable` runs it
-with a watcher: on cancellation it terminates the child's *whole process tree*
-(`taskkill /T` on Windows, the process group elsewhere), because an installer is
-usually a launcher and killing only the launcher leaves the real work running.
+It covers downloads and benchmarks, and only those — the two operations long
+enough to be worth stopping mid-flight. Installations are not cancellable: core
+runs an installer to completion, which is why `ollama_install` and
+`python_install_python` have no progress variant and no Cancel.
+
+`DownloadManager` holds a token of its own rather than a private flag, so its
+`cancel`, the reason it was given, and the event its worker and keyboard
+listener wake on are the same mechanism a benchmark uses. It is one-way by
+design, which matches a session that cannot be restarted once cancelled.
 
 The panel's side is in `gui/jobs.py`: a job holds a canceller — the token's
 `cancel` for a benchmark, `DownloadManager.cancel` for a download — so the request
@@ -509,20 +537,6 @@ describes a running operation and would otherwise flip the badge back to "runnin
 A paused download stays `running` in core's own state and is reported with
 `paused: true`, which the panel renders as its own badge — the transfer is
 suspended, not over.
-
-### Tests
-
-`tests/` covers the job, store and worker layers and both tool surfaces against a
-stubbed `mcp`, with each test given its own store directory so nothing is written
-into the real `Core/data/progress`. `tests/test_panel_instances.py` is the
-regression for the duplicate bars specifically: it asserts that exactly the three
-starting tools advertise the panel, that the tools the model polls with do not, and
-that 25 polls of one benchmark yield one id, one record on disk and an empty
-registry.
-
-```bash
-python -m pytest tests -q
-```
 
 ## Error handling
 

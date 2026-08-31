@@ -53,10 +53,12 @@ if str(CORE_ROOT) not in sys.path:
 # exception raised inside core does not match the class this layer caught it with.
 from core import logging as core_logging  # noqa: E402
 from core.system import hardware, scanner  # noqa: E402
-from core.download_manager.manager import (  # noqa: E402
-    ALLOWED_DOMAINS,
-    DownloadManager,
-)
+from core.download_manager.manager import DownloadManager  # noqa: E402
+
+# The whitelist lives in its own module so the manager and the downloader
+# validate against one list; it is read from there rather than through either of
+# them.
+from core.download_manager.sources import ALLOWED_DOMAINS  # noqa: E402
 from core.ollama import experiment, model, runtime  # noqa: E402
 from core.python import environment, installer, tools  # noqa: E402
 
@@ -91,11 +93,17 @@ Suggested order of operations:
   download_get_status. Only the domains listed by
   download_list_allowed_domains are accepted.
 - Core logs every significant operation; logs_read surfaces detail that a
-  tool's return value may not include, especially after a failure.
+  tool's return value may not include, especially after a failure. Pass
+  line_count to read only the newest entries, and call logs_get_file_info first
+  to see how large the log has grown.
 - When Ollama itself misbehaves — the service will not start, a model fails to
   load, the GPU is not picked up — its own log files carry detail core never
-  sees: call list_ollama_logs for the available file names and their sizes, then
-  read_ollama_logs with the one you need.
+  sees: call list_ollama_logs for the available file names with their sizes and
+  line counts, then read_ollama_logs with the one you need, using start_line and
+  end_line to page through a large file.
+- Before overwriting a script with python_edit_script, read it with
+  python_read_script: the edit replaces the whole file and the previous content
+  is not recoverable.
 
 Downloads and benchmarks have a '_with_progress' variant that runs the work in
 the background and renders a live progress bar in the conversation. Both return a
@@ -192,7 +200,7 @@ def surface_core_errors(function: CallableT) -> CallableT:
 
 
 # ============================================================
-# System — core.System
+# System — core.system
 # ============================================================
 
 def register_system_tools(server: MCPServer) -> None:
@@ -305,17 +313,19 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="list_ollama_logs",
         title="List Ollama log files",
         description=(
-            "List the Ollama log files present on this machine with the size of "
-            "each, without reading them: the live app.log and server.log plus "
-            "the rotated app-N.log and server-N.log copies, from "
-            "%LOCALAPPDATA%\\Ollama on Windows or ~/.ollama/logs elsewhere. "
-            "Returns 'sizes' as a {file name: size in bytes} dict for a quick "
-            "comparison, 'files' with each file's full path and modification "
-            "time as well, 'names' alone, and 'total_bytes'; everything is "
-            "ordered most recently modified first. Call this first and use the "
-            "sizes to choose — read_ollama_logs returns a whole file unless a "
-            "line range is requested, and server.log is often megabytes. Fails "
-            "when no Ollama log directory exists."
+            "List the Ollama log files present on this machine with the size "
+            "and line count of each, without reading them: the live app.log "
+            "and server.log plus the rotated app-N.log and server-N.log "
+            "copies, from %LOCALAPPDATA%\\Ollama on Windows or ~/.ollama/logs "
+            "elsewhere. Returns 'files' as a list of {name, path, size_bytes, "
+            "line_count, modified} ordered most recently modified first, the "
+            "'directories' searched, and 'total_bytes'. Call this first and use "
+            "the sizes to choose — read_ollama_logs returns a whole file unless "
+            "a line range is requested, and server.log is often megabytes. The "
+            "line count is the bound to aim that range at: it is counted the "
+            "same way read_ollama_logs numbers its lines, so it can be passed "
+            "straight back as end_line. Fails when no Ollama log directory "
+            "exists."
         ),
         annotations=READ_ONLY,
     )
@@ -332,23 +342,26 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
             "present depend on how often Ollama has rotated its logs. Only a "
             "bare file name is accepted, not a path. By default the whole "
             "file is returned with nothing truncated, and server.log in "
-            "particular can run to megabytes — so check the sizes "
-            "list_ollama_logs returns, prefer the smallest file that covers "
-            "the period you care about, and pass start_line and end_line "
-            "(1-based and inclusive; end_line may be omitted to read through "
-            "the end) to page through the large ones instead. The response "
-            "reports 'total_lines', so a range that comes back empty started "
-            "past the end of the file. server.log is the one that says why "
-            "the service or a model load failed and for GPU detection, "
-            "app.log for the desktop application. These are Ollama's own "
-            "logs; logs_read serves this project's execution log instead."
+            "particular can run to megabytes — so check the sizes and line "
+            "counts list_ollama_logs returns, prefer the smallest file that "
+            "covers the period you care about, and pass start_line and "
+            "end_line (1-based and inclusive; start_line defaults to the first "
+            "line and end_line to the last) to page through the large ones "
+            "instead. The response reports 'total_lines' for the whole file "
+            "and the 'start_line' and 'end_line' actually returned, both null "
+            "when the range matched nothing — which is what a range starting "
+            "past the end of the file looks like. server.log is the one that "
+            "says why the service or a model load failed and for GPU "
+            "detection, app.log for the desktop application. These are "
+            "Ollama's own logs; logs_read serves this project's execution log "
+            "instead."
         ),
         annotations=READ_ONLY,
     )
     @surface_core_errors
     def read_ollama_logs(
         file_name: str,
-        start_line: int | None = None,
+        start_line: int = 1,
         end_line: int | None = None,
     ) -> dict:
         """Read one Ollama log file, in full or a line range.
@@ -356,12 +369,12 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         Args:
             file_name: Log file name from list_ollama_logs, for example
                 'server.log' or 'app-2.log'.
-            start_line: First line to return, 1-based. Optional.
+            start_line: First line to return, 1-based. Defaults to the first.
             end_line: Last line to return, inclusive. Optional.
 
         Returns:
             dict: The file's name, path, size, modification time, total line
-                count, and the contents of the requested lines.
+                count, the range actually returned, and its contents.
         """
         return runtime.read_ollama_logs(
             file_name=file_name,
@@ -1020,12 +1033,37 @@ def register_python_tools(server: MCPServer) -> None:
         return tools.create_script(path=path, content=content)
 
     @server.tool(
+        name="python_read_script",
+        title="Read a script file",
+        description=(
+            "Return the source text of an existing Python script. Reads only "
+            "files with a .py extension and fails when the path does not "
+            "exist, so it is the way to inspect a script before rewriting it "
+            "with python_edit_script — that tool is a full overwrite, and the "
+            "previous content is not recoverable afterwards."
+        ),
+        annotations=READ_ONLY,
+    )
+    @surface_core_errors
+    def python_read_script(path: str) -> str:
+        """Read a Python script file.
+
+        Args:
+            path: Script file to read.
+
+        Returns:
+            str: Source text of the script.
+        """
+        return tools.read_script(path=path)
+
+    @server.tool(
         name="python_edit_script",
         title="Overwrite a script file",
         description=(
             "Replace the entire contents of an existing Python script. This is "
-            "a full overwrite, not a patch: the previous content is lost. "
-            "Fails if the file does not exist."
+            "a full overwrite, not a patch: the previous content is lost, so "
+            "read it with python_read_script first when any of it needs to be "
+            "kept. Fails if the file does not exist."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1414,7 +1452,8 @@ def register_download_tools(server: MCPServer) -> None:
         description=(
             "Report a session's running, paused and cancelled state, which file "
             "is active, and per-file status with bytes downloaded, total size, "
-            "and any error. Poll this to follow progress."
+            "current transfer speed in bytes per second, and any error. Poll "
+            "this to follow progress."
         ),
         annotations=READ_ONLY,
     )
@@ -1636,10 +1675,15 @@ def register_logging_tools(server: MCPServer) -> None:
         description=(
             "Read entries from the execution log that core writes for every "
             "significant operation. Each entry carries a timestamp, severity, "
-            "component, action, message, and a details object. The filters are "
-            "exact-match and combine, so level='ERROR' with "
+            "component, action, message, and a details object. The three value "
+            "filters are exact-match and combine, so level='ERROR' with "
             "component='download_manager' returns only failed downloads. "
-            "Returns an empty list when the log file does not exist yet."
+            "line_count then caps how many of those matches come back, keeping "
+            "the most recent ones — the log is appended in chronological order, "
+            "so a cap reads the newest end of it; entries are returned oldest "
+            "first either way. Call logs_get_file_info first to see how many "
+            "entries the log holds before reading it uncapped. Returns an empty "
+            "list when the log file does not exist yet."
         ),
         annotations=READ_ONLY,
     )
@@ -1648,6 +1692,7 @@ def register_logging_tools(server: MCPServer) -> None:
         level: str | None = None,
         component: str | None = None,
         action: str | None = None,
+        line_count: int | None = None,
     ) -> list[dict]:
         """Read filtered execution log entries.
 
@@ -1656,29 +1701,37 @@ def register_logging_tools(server: MCPServer) -> None:
             component: Optional component, for example 'ollama/runtime',
                 'ollama/model', 'system/scanner', 'python', 'download_manager'.
             action: Optional action, for example 'start', 'run', 'download_failed'.
+            line_count: Optional maximum number of entries, counted back from
+                the newest match.
 
         Returns:
-            list[dict]: Matching log entries in file order.
+            list[dict]: Matching log entries in file order, oldest first.
         """
         return core_logging.read_logs(
             level=level,
             component=component,
             action=action,
+            line_count=line_count,
         )
 
     @server.tool(
-        name="logs_get_path",
-        title="Get the execution log path",
+        name="logs_get_file_info",
+        title="Get the execution log's path and size",
         description=(
-            "Return the absolute path of the execution log file, creating its "
-            "data directory if needed. Useful for reading or archiving the raw "
-            "log outside these tools."
+            "Describe the execution log file without reading it: its absolute "
+            "path, how many entries it holds, and its size in bytes. Use the "
+            "entry count to decide whether to pass line_count to logs_read, "
+            "and the path to read or archive the raw log outside these tools. "
+            "A log that has never been written to reports zero lines and zero "
+            "bytes rather than failing."
         ),
         annotations=READ_ONLY,
     )
     @surface_core_errors
-    def logs_get_path() -> str:
-        return str(core_logging.get_execution_log_path())
+    def logs_get_file_info() -> dict:
+        info = core_logging.get_log_file_info()
+
+        return {**info, "path": str(info["path"])}
 
 
 # ============================================================

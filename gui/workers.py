@@ -123,6 +123,23 @@ def format_bytes(count: float | None) -> str:
     return f"{size:.1f} TB"
 
 
+def format_speed(bytes_per_second: float | None) -> str | None:
+    """Format a transfer rate for the panel.
+
+    Args:
+        bytes_per_second: Rate core measured, or None when it has none yet.
+
+    Returns:
+        str | None: Rate per second, or None when there is nothing to show —
+        which is how a queue that has not started, or one that is paused,
+        reports itself.
+    """
+    if not bytes_per_second:
+        return None
+
+    return f"{format_bytes(bytes_per_second)}/s"
+
+
 # ============================================================
 # Downloads
 # ============================================================
@@ -256,6 +273,7 @@ def _apply_download_status(job: Job, status: dict) -> None:
     downloaded_total = 0
     expected_total = 0
     sizes_known = True
+    active_speed: float | None = None
 
     job.sync_paused(bool(status["paused"]))
 
@@ -281,6 +299,14 @@ def _apply_download_status(job: Job, status: dict) -> None:
             else state
         )
 
+        # Core measures the rate per item, so the row carries its own and the
+        # chip under the bar shows whichever row is transferring.
+        speed = format_speed(item.get("speed")) if state == "downloading" else None
+
+        if speed is not None:
+            detail = f"{detail} · {speed}"
+            active_speed = item.get("speed")
+
         if state == "paused":
             detail = f"{format_bytes(downloaded)} · stopped"
 
@@ -299,17 +325,24 @@ def _apply_download_status(job: Job, status: dict) -> None:
     if sizes_known and expected_total:
         job.set_percent(100.0 * downloaded_total / expected_total)
 
-    job.set_metrics(
-        [
-            Metric("downloaded", format_bytes(downloaded_total)),
-            Metric("total", format_bytes(expected_total) if expected_total else "?"),
-            Metric(
-                "file",
-                f"{min(status['current_index'] + 1, status['total_files'])}"
-                f"/{status['total_files']}",
-            ),
-        ]
-    )
+    metrics = [
+        Metric("downloaded", format_bytes(downloaded_total)),
+        Metric("total", format_bytes(expected_total) if expected_total else "?"),
+        Metric(
+            "file",
+            f"{min(status['current_index'] + 1, status['total_files'])}"
+            f"/{status['total_files']}",
+        ),
+    ]
+
+    # Only while something is actually transferring: a rate left on the panel
+    # after the queue stopped would read as though it still were.
+    rate = format_speed(active_speed)
+
+    if rate is not None:
+        metrics.append(Metric("speed", rate))
+
+    job.set_metrics(metrics)
 
 
 # Set by the server layer so a cancelled session can be dropped from wherever it
@@ -648,7 +681,7 @@ def _tail_benchmark(
         prompt_count: Prompts per configuration.
         single: Whether the rows are prompts rather than configurations.
     """
-    tail = LogTail(core_logging.get_execution_log_path())
+    tail = LogTail(core_logging.get_log_file_info()["path"])
     rows = {name: index for index, name in enumerate(names)}
 
     try:

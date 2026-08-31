@@ -10,6 +10,10 @@ for a one-off query but not for polling several times a second, so this module
 keeps a byte offset and parses only what was appended since the last read. The
 line format is core's, mirrored here rather than reimplemented: timestamp,
 level, component, action, message, and a JSON details object, joined by ``" | "``.
+Only the four leading fields are free of that separator — a message or a details
+value may contain it — so the boundary between the message and the details is
+found the way core finds it, by taking the longest trailing segment that parses
+as JSON.
 """
 
 from __future__ import annotations
@@ -18,7 +22,10 @@ import json
 from pathlib import Path
 
 FIELD_SEPARATOR = " | "
-FIELD_COUNT = 6
+
+# Fields before the message: timestamp, level, component, action. The message
+# and details are what remains once those are split off.
+LEADING_FIELDS = 4
 
 
 class LogTail:
@@ -33,7 +40,7 @@ class LogTail:
 
         Args:
             path: Execution log file path, from
-                ``core.logging.get_execution_log_path``.
+                ``core.logging.get_log_file_info``.
         """
         self.path = path
 
@@ -90,21 +97,28 @@ def _parse(line: str) -> dict | None:
         ``action``, ``message`` and ``details``, or None when the line is not a
         well-formed entry.
     """
-    parts = line.strip().split(FIELD_SEPARATOR)
+    parts = line.strip().split(FIELD_SEPARATOR, LEADING_FIELDS)
 
-    if len(parts) != FIELD_COUNT:
+    if len(parts) != LEADING_FIELDS + 1:
         return None
 
-    try:
-        details = json.loads(parts[5])
-    except json.JSONDecodeError:
-        return None
+    # A benchmark's message and its details both routinely contain " | ", so the
+    # split point is the earliest one whose remainder is valid JSON.
+    segments = parts[LEADING_FIELDS].split(FIELD_SEPARATOR)
 
-    return {
-        "timestamp": parts[0],
-        "level": parts[1],
-        "component": parts[2],
-        "action": parts[3],
-        "message": parts[4],
-        "details": details if isinstance(details, dict) else {},
-    }
+    for position in range(1, len(segments)):
+        try:
+            details = json.loads(FIELD_SEPARATOR.join(segments[position:]))
+        except json.JSONDecodeError:
+            continue
+
+        return {
+            "timestamp": parts[0],
+            "level": parts[1],
+            "component": parts[2],
+            "action": parts[3],
+            "message": FIELD_SEPARATOR.join(segments[:position]),
+            "details": details if isinstance(details, dict) else {},
+        }
+
+    return None
