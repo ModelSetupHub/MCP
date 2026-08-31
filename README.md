@@ -23,6 +23,9 @@ job bookkeeping behind it.
 │       ├── progress.css
 │       └── progress.js
 ├── requirements.txt
+├── utils/             # the Claude Setup Utility
+│   ├── claude_setup.py
+│   └── icon.ico
 └── Core/              # submodule
     └── core/          # backend logic
 ```
@@ -555,3 +558,28 @@ ToolError: Error executing tool download_add:
 ```
 
 Core exceptions are forwarded, never caught and replaced.
+
+## Claude Setup Utility
+
+`utils/claude_setup.py` is a standalone desktop tool rather than an MCP tool: a
+single-window Tkinter app that installs Claude Desktop and registers MCP
+servers in `claude_desktop_config.json` — the same file as the client
+configuration above, so pointing its form at `main.py` is the manual way to
+give Claude Desktop this project's server. The installer is downloaded from
+Anthropic's official per-architecture endpoints, with the links currently
+advertised on the download page as a fallback, and entries are written for
+both a classic install and the redirected location a Microsoft Store
+(packaged) install reads. Claude, the Python interpreter and the config file
+are all resolved at runtime from the registry, the `py` launcher and `PATH` —
+nothing is hard-coded — and the config is backed up before every write.
+
+It uses only the standard library, so it runs either as a script or as a
+frozen bundle:
+
+```bash
+python utils/claude_setup.py
+pyinstaller --onefile --noconsole utils/claude_setup.py
+```
+
+Detection and installation require Windows; on any other platform the window
+still opens, but says detection is unavailable.

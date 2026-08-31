@@ -42,7 +42,7 @@ if IS_WINDOWS:
 else:  # importable elsewhere so the window can explain why it is disabled
     winreg = None  # type: ignore[assignment]
 
-APP_NAME = "Claude MCP Setup"
+APP_NAME = "Claude Setup Utility"
 APP_VERSION = "2.0"
 
 # Claude Desktop's own download page, both as the human fallback and as the
@@ -1232,6 +1232,26 @@ def launch_installer(installer: Path) -> None:
 # User interface
 # ============================================================
 
+def window_icon() -> Path | None:
+    """Locate the ``icon.ico`` file that ships beside this program.
+
+    As a script the icon sits in this file's directory; a frozen bundle has
+    PyInstaller unpack its data files into ``sys._MEIPASS``.
+
+    Returns:
+        Path | None: Icon path, or None when the file is not present.
+    """
+    if FROZEN:
+        extracted = getattr(sys, "_MEIPASS", "")
+        base = Path(extracted) if extracted else Path(sys.executable).parent
+    else:
+        base = Path(__file__).resolve().parent
+
+    candidate = base / "icon.ico"
+
+    return candidate if candidate.is_file() else None
+
+
 PALETTE = {
     "bg": "#f4f5f7",
     "card": "#ffffff",
@@ -1264,9 +1284,19 @@ class SetupWindow:
         self.wrap_labels: list[tuple[ttk.Label, int]] = []
         self.last_width = 0
 
-        self.root.title(f"{APP_NAME} {APP_VERSION}")
+        self.root.title(APP_NAME)
         self.root.configure(bg=PALETTE["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        icon = window_icon()
+
+        if icon is not None:
+            try:
+                self.root.iconbitmap(str(icon))
+            except tk.TclError:
+                # An unreadable icon (corrupt file, .ico on X11) must not stop
+                # the window from opening; the default icon is fine.
+                pass
 
         self._build_style()
         self._build_layout()
@@ -1275,7 +1305,7 @@ class SetupWindow:
         self._center(940, 760)
         self.root.bind("<Configure>", self._on_resize)
 
-        self.log(f"{APP_NAME} {APP_VERSION} started.", "info")
+        self.log(f"{APP_NAME} started.", "info")
 
         if not IS_WINDOWS:
             self.log(
@@ -1332,6 +1362,12 @@ class SetupWindow:
             background=PALETTE["card"],
             foreground=PALETTE["muted"],
             font=(base[0], 9),
+        )
+        style.configure(
+            "Credit.TLabel",
+            background=PALETTE["bg"],
+            foreground=PALETTE["muted"],
+            font=(base[0], 8),
         )
         style.configure(
             "Ok.TLabel",
@@ -1535,6 +1571,14 @@ class SetupWindow:
             ),
             margin=60,
         ).pack(anchor="w", pady=(2, 0))
+
+        # This claims the bottom edge before the footer does, so it sits below
+        # the footer row at the very bottom of the window.
+        ttk.Label(
+            outer,
+            text="Part of the MSH project.",
+            style="Credit.TLabel",
+        ).pack(side="bottom", anchor="center")
 
         # The footer claims its height before the notebook does, so its buttons
         # can never be pushed off the bottom edge by tall tab content.
