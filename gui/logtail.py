@@ -1,18 +1,18 @@
-"""Incremental reader for the execution log core already writes.
+"""Incremental reader for the execution log MSHCore already writes.
 
-Core logs every significant operation through ``core.logging.write_log`` —
-including per-prompt benchmark results, which no core function returns while it
+Core logs every significant operation through ``MSHCore.logging.write_log`` —
+including per-prompt benchmark results, which no MSHCore function returns while it
 is still running. Reading those entries back is the only way this layer can
-report fine-grained progress without changing core.
+report fine-grained progress without changing MSHCore.
 
-``core.logging.read_logs`` re-parses the whole file on every call, which is fine
+``MSHCore.logging.read_logs`` re-parses the whole file on every call, which is fine
 for a one-off query but not for polling several times a second, so this module
 keeps a byte offset and parses only what was appended since the last read. The
-line format is core's, mirrored here rather than reimplemented: timestamp,
+line format is MSHCore's, mirrored here rather than reimplemented: timestamp,
 level, component, action, message, and a JSON details object, joined by ``" | "``.
 Only the four leading fields are free of that separator — a message or a details
 value may contain it — so the boundary between the message and the details is
-found the way core finds it, by taking the longest trailing segment that parses
+found the way MSHCore finds it, by taking the longest trailing segment that parses
 as JSON.
 """
 
@@ -35,12 +35,12 @@ class LogTail:
         """Start tailing at the current end of the log.
 
         Entries already in the file belong to earlier operations, so the initial
-        offset is the file's current size. A missing file starts at zero: core
+        offset is the file's current size. A missing file starts at zero: MSHCore
         creates it on the first write, and the next read picks it up.
 
         Args:
             path: Execution log file path, from
-                ``core.logging.get_log_file_info``.
+                ``MSHCore.logging.get_log_file_info``.
         """
         self.path = path
 
@@ -54,7 +54,7 @@ class LogTail:
     def read_new(self) -> list[dict]:
         """Read and parse the entries appended since the previous call.
 
-        A read can land mid-line while core is writing, so a trailing fragment
+        A read can land mid-line while MSHCore is writing, so a trailing fragment
         is held back and completed on the next call rather than discarded.
 
         Returns:

@@ -63,14 +63,14 @@ CallableT = TypeVar("CallableT", bound=Callable[..., Any])
 
 
 def surface_core_errors(function: CallableT) -> CallableT:
-    """Forward exceptions raised by core to the MCP client verbatim.
+    """Forward exceptions raised by MSHCore to the MCP client verbatim.
 
     Mirrors the decorator in ``main.py``: the SDK reports any exception other than
     ``ToolError`` as a generic tool crash, which would hide the descriptive
-    messages core raises.
+    messages MSHCore raises.
 
     Args:
-        function: Tool function that calls into the core package.
+        function: Tool function that calls into the MSHCore package.
 
     Returns:
         CallableT: Wrapped function preserving the original error text.
@@ -398,7 +398,7 @@ def _no_result_reason(snapshot: dict) -> str:
 
 CANCEL_DESCRIPTION = (
     "Cancel the operation with this progress_id and undo what it had done. "
-    "The download or benchmark stops at its next safe point, core removes "
+    "The download or benchmark stops at its next safe point, MSHCore removes "
     "everything it created — partial and completed downloads, a loaded "
     "model — and records a cancelled entry in the execution log. For a "
     "download the session is removed too, so downloading the same files "
@@ -418,7 +418,7 @@ PAUSE_DESCRIPTION = (
 
 
 def cancel_operation(progress_id: str) -> dict:
-    """End one operation and have core undo what it did.
+    """End one operation and have MSHCore undo what it did.
 
     Args:
         progress_id: Identifier returned by a tracked tool.
@@ -438,9 +438,9 @@ def cancel_operation(progress_id: str) -> dict:
 def pause_operation(progress_id: str) -> dict:
     """Suspend one download, or continue a suspended one.
 
-    Cancel and Stop are different operations. Cancel ends the task and has core
+    Cancel and Stop are different operations. Cancel ends the task and has MSHCore
     undo it, and applies to both kinds. Stop only suspends a download and leaves the
-    task intact, so it exists for downloads alone — they are the only operation core
+    task intact, so it exists for downloads alone — they are the only operation MSHCore
     can pause and resume.
 
     Args:
@@ -814,9 +814,9 @@ def _register_benchmarks(apps: Apps) -> None:
 def _normalise(configurations: list[dict]) -> list[dict]:
     """Validate and name the configurations before the worker starts.
 
-    Core normalises these itself, but it does so on the worker thread — after the
+    MSHCore normalises these itself, but it does so on the worker thread — after the
     tool has returned. Doing it here means a malformed configuration is a tool
-    error the model can act on, and the row names are known before core runs.
+    error the model can act on, and the row names are known before MSHCore runs.
 
     Args:
         configurations: Configurations as given to the tool.

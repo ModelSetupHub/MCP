@@ -1,8 +1,12 @@
 """ModelSetupHub MCP server.
 
-Serves the read-only ``core`` package from the ``Core`` submodule over the Model
-Context Protocol. Every tool is a thin pass-through to an existing core
-function; no business logic lives here.
+Serves the ``MSHCore`` package (the ``Core`` submodule) over the Model Context
+Protocol. Every tool is a thin pass-through to an existing MSHCore function; no
+business logic lives here.
+
+MSHCore must be installed with pip before the server can start (see
+README.md): from the repository root run ``python utils/install_mshcore.py``
+or ``pip install ./Core``.
 
 Run over stdio:
 
@@ -23,7 +27,6 @@ Client configuration:
 from collections.abc import Callable
 import functools
 from pathlib import Path
-import sys
 import threading
 from typing import Any, TypeVar
 
@@ -31,36 +34,27 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import MCPServerError, ToolError
 from mcp.types import ToolAnnotations
 
-# The core package imports itself as a top-level package (`from core.logging
-# import write_log`), so the directory *containing* it — the Core submodule root,
-# not `core` itself — goes on sys.path before it can be imported.
 PROJECT_ROOT = Path(__file__).resolve().parent
-CORE_ROOT = PROJECT_ROOT / "Core"
 
-if not (CORE_ROOT / "core" / "__init__.py").is_file():
+try:
+    import MSHCore  # noqa: F401
+except ImportError as error:
     raise RuntimeError(
-        f"The core package was not found at {CORE_ROOT / 'core'}. The Core "
-        f"submodule must be checked out: run 'git submodule update --init' "
-        f"in {PROJECT_ROOT}."
-    )
+        "The MSHCore package is not installed. Install it with pip before "
+        f"starting this server: run 'python utils/install_mshcore.py' or "
+        f"'pip install ./Core' in {PROJECT_ROOT}."
+    ) from error
 
-if str(CORE_ROOT) not in sys.path:
-    sys.path.insert(0, str(CORE_ROOT))
-
-# Core is imported the same way it imports itself — as the top-level `core`
-# package — because `Core.core.x` and `core.x` are two distinct module objects
-# holding two distinct copies of every class. Mixing the spellings means an
-# exception raised inside core does not match the class this layer caught it with.
-from core import logging as core_logging  # noqa: E402
-from core.system import hardware, scanner  # noqa: E402
-from core.download_manager.manager import DownloadManager  # noqa: E402
+from MSHCore import logging as core_logging  # noqa: E402
+from MSHCore.system import hardware, scanner  # noqa: E402
+from MSHCore.download_manager.manager import DownloadManager  # noqa: E402
 
 # The whitelist lives in its own module so the manager and the downloader
 # validate against one list; it is read from there rather than through either of
 # them.
-from core.download_manager.sources import ALLOWED_DOMAINS  # noqa: E402
-from core.ollama import experiment, model, runtime  # noqa: E402
-from core.python import environment, installer, tools  # noqa: E402
+from MSHCore.download_manager.sources import ALLOWED_DOMAINS  # noqa: E402
+from MSHCore.ollama import experiment, model, runtime  # noqa: E402
+from MSHCore.python import environment, installer, tools  # noqa: E402
 
 # The in-chat progress panel, the tools that draw it, and the plain tools that
 # read one afterwards. Every frontend file lives under gui/; this layer only hands
@@ -92,12 +86,12 @@ Suggested order of operations:
 - Downloads are asynchronous: create a session, queue URLs, start it, then poll
   download_get_status. Only the domains listed by
   download_list_allowed_domains are accepted.
-- Core logs every significant operation; logs_read surfaces detail that a
+- MSHCore logs every significant operation; logs_read surfaces detail that a
   tool's return value may not include, especially after a failure. Pass
   line_count to read only the newest entries, and call logs_get_file_info first
   to see how large the log has grown.
 - When Ollama itself misbehaves — the service will not start, a model fails to
-  load, the GPU is not picked up — its own log files carry detail core never
+  load, the GPU is not picked up — its own log files carry detail MSHCore never
   sees: call list_ollama_logs for the available file names with their sizes and
   line counts, then read_ollama_logs with the one you need, using start_line and
   end_line to page through a large file.
@@ -139,7 +133,7 @@ wanted from a single call and no progress bar is needed.
 
 Two different controls act on a running operation, both taking its progress_id:
 
-- progress_cancel ends the task and has core undo it — partial and completed
+- progress_cancel ends the task and has MSHCore undo it — partial and completed
   downloads are deleted, a loaded model is unloaded — leaving a 'cancelled'
   entry in the execution log, which logs_read will show. It applies to
   downloads and benchmarks alike, and cannot be undone.
@@ -171,16 +165,16 @@ CallableT = TypeVar("CallableT", bound=Callable[..., Any])
 
 
 def surface_core_errors(function: CallableT) -> CallableT:
-    """Forward exceptions raised by core to the MCP client verbatim.
+    """Forward exceptions raised by MSHCore to the MCP client verbatim.
 
     The SDK treats any exception other than ``ToolError`` as a crash: the client
     gets a generic ``Error executing tool <name>`` and the real message stays on
-    the server. Core raises descriptive exceptions, so they are re-raised here
+    the server. MSHCore raises descriptive exceptions, so they are re-raised here
     with type name and message intact and the original chained as ``__cause__``.
-    Core exceptions are forwarded, never replaced.
+    MSHCore exceptions are forwarded, never replaced.
 
     Args:
-        function: Tool function that calls into the core package.
+        function: Tool function that calls into the MSHCore package.
 
     Returns:
         CallableT: Wrapped function preserving the original error text.
@@ -200,7 +194,7 @@ def surface_core_errors(function: CallableT) -> CallableT:
 
 
 # ============================================================
-# System — core.system
+# System — MSHCore.system
 # ============================================================
 
 def register_system_tools(server: MCPServer) -> None:
@@ -282,14 +276,14 @@ def register_system_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Ollama runtime — core.ollama.runtime
+# Ollama runtime — MSHCore.ollama.runtime
 # ============================================================
 
 def register_ollama_runtime_tools(server: MCPServer) -> None:
     """Register Ollama service lifecycle tools.
 
     The mutating tools return ``get_status()`` afterwards, since the underlying
-    core functions return ``None``.
+    MSHCore functions return ``None``.
 
     Args:
         server: Server instance the tools are attached to.
@@ -468,7 +462,7 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Ollama models — core.ollama.model
+# Ollama models — MSHCore.ollama.model
 # ============================================================
 
 def register_ollama_model_tools(server: MCPServer) -> None:
@@ -708,7 +702,7 @@ def register_ollama_model_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Benchmarking — core.ollama.experiment
+# Benchmarking — MSHCore.ollama.experiment
 # ============================================================
 
 def register_ollama_experiment_tools(server: MCPServer) -> None:
@@ -809,7 +803,7 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Python — core.python
+# Python — MSHCore.python
 # ============================================================
 
 def register_python_tools(server: MCPServer) -> None:
@@ -1182,19 +1176,19 @@ def register_python_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Downloads — core.download_manager
+# Downloads — MSHCore.download_manager
 # ============================================================
 
 # How long a cancellation waits for the download worker to stop before the tool
 # reports back. The worker exits at a chunk boundary, so this only has to cover
-# one chunk read plus core's own cleanup.
+# one chunk read plus MSHCore's own cleanup.
 CANCEL_WAIT_SECONDS = 60.0
 
 # DownloadManager is stateful: a queue is built up, started, then controlled and
 # polled while a background thread downloads. MCP tool calls are individually
 # stateless, so named manager instances are kept here and each tool acts on one
 # by session_id. This registry is the only state this layer adds; queueing,
-# retrying, resuming, and progress tracking all stay in core.
+# retrying, resuming, and progress tracking all stay in MSHCore.
 #
 # A cancelled session is dropped from the registry as part of the cancellation,
 # not left behind in a cancelled state: its queue and files are gone, so keeping
@@ -1277,7 +1271,7 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_list_allowed_domains",
         title="List allowed download domains",
         description=(
-            "List the domains downloads may come from. Core rejects any other "
+            "List the domains downloads may come from. MSHCore rejects any other "
             "host, so check this before queueing a URL."
         ),
         annotations=READ_ONLY,
@@ -1591,7 +1585,7 @@ def register_download_tools(server: MCPServer) -> None:
             dict: Session status after the cancellation and cleanup.
         """
         manager = _get_session(session_id)
-        # Core is told first, because its first cancellation is the one that
+        # MSHCore is told first, because its first cancellation is the one that
         # decides whether the files go: notifying the panel's job first would
         # cancel through the job's own canceller, which always deletes.
         manager.cancel(cleanup=not keep_files)
@@ -1606,7 +1600,7 @@ def register_download_tools(server: MCPServer) -> None:
             ),
         )
         # The worker stops at a chunk boundary, so the status is only final once
-        # it has actually exited and core's cleanup has run.
+        # it has actually exited and MSHCore's cleanup has run.
         manager.wait_until_stopped(timeout=CANCEL_WAIT_SECONDS)
 
         status = _discard_session(session_id) or manager.get_status()
@@ -1642,7 +1636,7 @@ def register_download_tools(server: MCPServer) -> None:
         """
         manager = _get_session(session_id)
         # Closing a session is bookkeeping, not a request to undo the download,
-        # so the files it produced are left alone. Core is told before the panel
+        # so the files it produced are left alone. MSHCore is told before the panel
         # for the same reason as in download_cancel: the job's own canceller
         # deletes, and the first cancellation is the one that decides.
         manager.close()
@@ -1656,10 +1650,10 @@ def register_download_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Logging — core.logging
+# Logging — MSHCore.logging
 # ============================================================
 
-# core.logging.write_log is deliberately not exposed: core writes its own
+# MSHCore.logging.write_log is deliberately not exposed: MSHCore writes its own
 # entries, and letting a client inject records would pollute the history.
 
 def register_logging_tools(server: MCPServer) -> None:
@@ -1673,7 +1667,7 @@ def register_logging_tools(server: MCPServer) -> None:
         name="logs_read",
         title="Read the execution log",
         description=(
-            "Read entries from the execution log that core writes for every "
+            "Read entries from the execution log that MSHCore writes for every "
             "significant operation. Each entry carries a timestamp, severity, "
             "component, action, message, and a details object. The three value "
             "filters are exact-match and combine, so level='ERROR' with "

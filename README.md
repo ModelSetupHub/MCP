@@ -1,9 +1,9 @@
 # ModelSetupHub MCP Server
 
-MCP (Model Context Protocol) layer over the `core` package in the `Core`
-submodule. Nearly every tool is a thin pass-through to an existing core
-function; the only logic this layer adds is the in-chat progress panel and the
-job bookkeeping behind it.
+MCP (Model Context Protocol) layer over the `MSHCore` package, provided by the
+`Core` submodule. Nearly every tool is a thin pass-through to an existing
+MSHCore function; the only logic this layer adds is the in-chat progress panel
+and the job bookkeeping behind it.
 
 ## Layout
 
@@ -16,46 +16,65 @@ job bookkeeping behind it.
 │   ├── jobs.py        # job model and the registry of jobs running now
 │   ├── store.py       # persisted snapshots — the source of truth
 │   ├── workers.py     # threads that run the operations and update their jobs
-│   ├── logtail.py     # incremental reader for core's execution log
+│   ├── logtail.py     # incremental reader for MSHCore's execution log
 │   ├── loader.py      # inlines the assets into one HTML document
 │   └── assets/
 │       ├── progress.html
 │       ├── progress.css
 │       └── progress.js
 ├── requirements.txt
-├── utils/             # the Claude Setup Utility
+├── utils/             # helper utilities
 │   ├── claude_setup.py
+│   ├── install_mshcore.py
 │   └── icon.ico
-└── Core/              # submodule
-    └── core/          # backend logic
+└── Core/              # submodule providing the MSHCore package
 ```
 
-`main.py` holds the MCP layer: `sys.path` wiring for the submodule, the error
-forwarder, one `register_*_tools` function per core module, and the
+`main.py` holds the MCP layer: the MSHCore availability check, the error
+forwarder, one `register_*_tools` function per MSHCore module, and the
 `create_server` / `main` entry point. Sections are separated by banner comments
-matching the core module they wrap.
+matching the MSHCore module they wrap.
 
-Before importing `core`, `main.py` puts the `Core` submodule root on `sys.path` —
-the directory *containing* `core`, not `core` itself — because core imports
-itself as a top-level package (`from core.logging import write_log`). If the
-submodule is not checked out, it raises at startup with the command needed to
-fetch it, rather than failing later on an opaque `ModuleNotFoundError`.
+`main.py` imports `MSHCore` as an installed package. If pip cannot find it, the
+server raises at startup with the command needed to install it, rather than
+failing later on an opaque `ModuleNotFoundError`.
 
-Core is then imported as `core.x`, never `Core.core.x`. Both spellings resolve to
-the same file but produce two separate module objects, each with its own copy of
-every class — so a `CancellationToken` handed to core and the
-`OperationCancelled` caught back from it would belong to different classes, and
-`except OperationCancelled` would silently miss it.
+Everything imports `MSHCore` the same way — as the top-level installed package.
+Importing the same files through two spellings (say, `MSHCore.x` in one place
+and `Core.MSHCore.x` in another) would produce two separate module objects,
+each with its own copy of every class — so a `CancellationToken` handed to
+MSHCore and the `OperationCancelled` caught back from it would belong to
+different classes, and `except OperationCancelled` would silently miss it.
 
 ## Install
 
+MSHCore must be installed with pip before the server can start. Easiest is the
+bundled utility, which installs it from the `Core` submodule into the current
+interpreter:
+
 ```bash
 git submodule update --init
+python utils/install_mshcore.py
+```
+
+Or install it directly:
+
+```bash
+pip install ./Core
+```
+
+Then install the server's own dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-Requires Python 3.10+. `psutil` is a core dependency, listed here because core
-ships no requirements file of its own.
+Requires Python 3.10+. `psutil` is an MSHCore dependency, listed here because
+MSHCore declares no dependencies of its own.
+
+`python utils/install_mshcore.py --check` reports whether MSHCore is already
+installed, `--editable` performs a development install, and `--force` reinstalls
+an existing one — useful after pulling new submodule commits.
 
 ## Run
 
@@ -78,14 +97,14 @@ The server speaks JSON-RPC over stdio. Client configuration:
 
 ## Tools
 
-59 tools. 49 are thin pass-throughs to core, grouped by area below; the other 10
-belong to the progress panel and are documented in [Progress panel](#progress-panel).
-Names are prefixed by area, and each carries MCP annotations so a client can tell
-a read-only call from a destructive one.
+59 tools. 49 are thin pass-throughs to MSHCore, grouped by area below; the other
+10 belong to the progress panel and are documented in
+[Progress panel](#progress-panel). Names are prefixed by area, and each carries
+MCP annotations so a client can tell a read-only call from a destructive one.
 
-### system — `core.system`
+### system — `MSHCore.system`
 
-| Tool | Core function |
+| Tool | MSHCore function |
 | --- | --- |
 | `system_scan` | `scanner.scan_system` |
 | `system_get_memory_info` | `hardware.get_memory_info` |
@@ -93,9 +112,9 @@ a read-only call from a destructive one.
 | `system_get_gpu_info` | `hardware.get_nvidia_info` |
 | `system_get_cuda_version` | `hardware.get_cuda_version` |
 
-### Ollama runtime — `core.ollama.runtime`
+### Ollama runtime — `MSHCore.ollama.runtime`
 
-| Tool | Core function |
+| Tool | MSHCore function |
 | --- | --- |
 | `ollama_get_status` | `get_status` |
 | `list_ollama_logs` | `list_ollama_logs` |
@@ -104,7 +123,7 @@ a read-only call from a destructive one.
 | `ollama_stop` | `stop` |
 | `ollama_install` | `install` |
 
-The mutating three return `get_status()` afterwards, since the core functions
+The mutating three return `get_status()` afterwards, since the MSHCore functions
 return `None`.
 
 The two log tools read Ollama's own log files — the live `app.log` and
@@ -125,9 +144,9 @@ matched nothing, which is what a range starting past the end of the file looks
 like. Because the line count `list_ollama_logs` reports is counted the same way,
 it can be passed straight back as `end_line`.
 
-### Ollama models — `core.ollama.model`
+### Ollama models — `MSHCore.ollama.model`
 
-| Tool | Core function |
+| Tool | MSHCore function |
 | --- | --- |
 | `ollama_list_models` | `list_models` |
 | `ollama_list_running_models` | `list_running_models` |
@@ -139,16 +158,16 @@ it can be passed straight back as `end_line`.
 | `ollama_configure_model` | `configure_model` |
 | `ollama_remove_model` | `remove_model` |
 
-### Benchmarking — `core.ollama.experiment`
+### Benchmarking — `MSHCore.ollama.experiment`
 
-| Tool | Core function |
+| Tool | MSHCore function |
 | --- | --- |
 | `ollama_run_test` | `run_test` |
 | `ollama_compare_tests` | `compare_tests` |
 
-### Python — `core.python`
+### Python — `MSHCore.python`
 
-| Tool | Core function |
+| Tool | MSHCore function |
 | --- | --- |
 | `python_get_status` | `installer.get_python_status` |
 | `python_get_python_path` | `environment.get_python_path` |
@@ -167,15 +186,15 @@ it can be passed straight back as `end_line`.
 `python_edit_script` is a full overwrite, so `python_read_script` is how the
 current content is retrieved before it is replaced.
 
-### Downloads — `core.download_manager`
+### Downloads — `MSHCore.download_manager`
 
 `DownloadManager` is stateful — build a queue, start it, then poll while a
 background thread works — but MCP calls are individually stateless. So `main.py`
 keeps named manager instances in a registry, and each tool acts on one by
 `session_id`. That registry is the only state this layer adds; queueing, retry,
-resume, and progress tracking all stay in core.
+resume, and progress tracking all stay in MSHCore.
 
-| Tool | Core member |
+| Tool | MSHCore member |
 | --- | --- |
 | `download_list_allowed_domains` | `sources.ALLOWED_DOMAINS` |
 | `download_create_session` | `DownloadManager(...)` |
@@ -210,18 +229,18 @@ Restarting a session that is still open only picks up what has not run:
 ones, so no file is fetched twice. It raises `RuntimeError` when every item has
 already run.
 
-Core rejects any host outside its whitelist, so check
+MSHCore rejects any host outside its whitelist, so check
 `download_list_allowed_domains` before queueing a URL. The list itself lives in
-`core/download_manager/sources.py`, which both validation points read — the
+`MSHCore/download_manager/sources.py`, which both validation points read — the
 manager when a file is queued and the downloader when the transfer starts — so
 the tool reports it from there rather than through either of them.
 
 `download_get_status` also reports each item's current transfer speed in bytes
-per second, which core measures per file.
+per second, which MSHCore measures per file.
 
-### Logging — `core.logging`
+### Logging — `MSHCore.logging`
 
-| Tool | Core function |
+| Tool | MSHCore function |
 | --- | --- |
 | `logs_read` | `read_logs` |
 | `logs_get_file_info` | `get_log_file_info` |
@@ -233,7 +252,7 @@ chronologically — while still returning them oldest first. `logs_get_file_info
 reports the log's path, entry count and size without reading it, which is how
 the size of an uncapped read is known in advance.
 
-`write_log` is not exposed: core writes its own entries, and letting a client
+`write_log` is not exposed: MSHCore writes its own entries, and letting a client
 inject arbitrary records would pollute the execution history.
 
 ## Progress panel
@@ -348,41 +367,41 @@ job, so there is nothing to collect afterwards. A benchmark is asked for
 measurements, and its starting call cannot deliver them — it returns an
 acknowledgement carrying a `progress_id`, with `result_available: false` and the
 contract spelled out in the response. The measurements are written to
-`Core/data/progress/results/` when the run finishes and handed over by
+`MSHCore/data/progress/results/` when the run finishes and handed over by
 `benchmark_get_result`, which is why they are not repeated in a snapshot polled
 several times a second: a comparison result is far larger than the progress around
 it.
 
-All of this lives in `gui/`; `core` is untouched by it.
+All of this lives in `gui/`; MSHCore is untouched by it.
 
-What each kind of operation reports is whatever core already exposes:
+What each kind of operation reports is whatever MSHCore already exposes:
 
 | Operation | Progress source |
 | --- | --- |
 | Downloads | `DownloadManager.get_status`, polled on a worker thread. Each item carries its own byte counts and transfer speed, so the rows show bytes and rate and the chip under the bar shows whichever file is transferring. `download_start_with_progress` returns as soon as the queue starts, like `download_start`, and the worker keeps the job current until the transfer ends. |
-| Benchmarks | Core logs an entry per prompt, so `gui/logtail.py` tails the execution log while `experiment.compare_tests` runs. For a comparison, the step names are the normalised configuration names. |
+| Benchmarks | MSHCore logs an entry per prompt, so `gui/logtail.py` tails the execution log while `experiment.compare_tests` runs. For a comparison, the step names are the normalised configuration names. |
 
-`gui/logtail.py` exists because `core.logging.read_logs` re-parses the whole file
-per call, which is fine for a query but not for polling several times a second.
-It keeps a byte offset, parses only what was appended, and holds back a trailing
-fragment so a read landing mid-write is not lost. It splits a line the way core
-does: only the four leading fields are free of the `" | "` separator, so the
-message and the JSON details are separated by taking the longest trailing
+`gui/logtail.py` exists because `MSHCore.logging.read_logs` re-parses the whole
+file per call, which is fine for a query but not for polling several times a
+second. It keeps a byte offset, parses only what was appended, and holds back a
+trailing fragment so a read landing mid-write is not lost. It splits a line the
+way MSHCore does: only the four leading fields are free of the `" | "` separator,
+so the message and the JSON details are separated by taking the longest trailing
 segment that parses as JSON.
 
 The log is a best-effort source of *live* progress, not the authority on the final
-state. Core writes a prompt's entry immediately before returning, so the reader's
-last read routinely misses it, and a prompt that failed before core got as far as
-logging produces no entry at all. Either way a row would be left reading "waiting"
-under a job already marked complete — which is what left the last configuration of
-a comparison stuck on "waiting". So when a benchmark returns, its reader is
-stopped, joined, and every row is then closed from the returned result, which is
-authoritative.
+state. MSHCore writes a prompt's entry immediately before returning, so the
+reader's last read routinely misses it, and a prompt that failed before MSHCore
+got as far as logging produces no entry at all. Either way a row would be left
+reading "waiting" under a job already marked complete — which is what left the
+last configuration of a comparison stuck on "waiting". So when a benchmark
+returns, its reader is stopped, joined, and every row is then closed from the
+returned result, which is authoritative.
 
-Core also records a failed prompt as a result entry rather than raising, so a run
-against a model that does not exist returns *normally* with every prompt failed.
-Classifying the result is what turns that into a `failed` job rather than a
-`completed` one with no measurements.
+MSHCore also records a failed prompt as a result entry rather than raising, so a
+run against a model that does not exist returns *normally* with every prompt
+failed. Classifying the result is what turns that into a `failed` job rather than
+a `completed` one with no measurements.
 
 The panel shows no clock. `elapsed_seconds` is still in the snapshot, because
 `progress_cancel` hands that snapshot to the model and how long an operation ran
@@ -412,17 +431,17 @@ The panel offers two controls, and they do different things.
 
 **Cancel** ends the task and undoes it. It applies to both tracked operations —
 download and benchmark — and behaves identically for each: the operation stops at
-its next safe point, core removes everything it created, and the requirement it is
-built around is that a cancelled operation leaves **no trace but the log entry**.
-It cannot be undone.
+its next safe point, MSHCore removes everything it created, and the requirement it
+is built around is that a cancelled operation leaves **no trace but the log
+entry**. It cannot be undone.
 
 **Stop** appears for downloads only and merely suspends the transfer. The queue,
 the files already fetched and the partial data are all kept; pressing it again
 resumes the active file from where it left off via an HTTP range request. It uses
-`DownloadManager.pause` / `resume`, which core already had — nothing new was
-written for it. Benchmarks have no equivalent, so no Stop button is shown for them,
-and calling `progress_pause` on one reports `unavailable` rather than cancelling it
-by surprise.
+`DownloadManager.pause` / `resume`, which MSHCore already had — nothing new was
+written for it. Benchmarks have no equivalent, so no Stop button is shown for
+them, and calling `progress_pause` on one reports `unavailable` rather than
+cancelling it by surprise.
 
 The two are styled to match that difference: Cancel is filled red, Stop is a
 quiet outlined button. Side by side in the same red, they would invite pressing
@@ -430,15 +449,15 @@ the wrong one.
 
 ### How a cancellation travels
 
-Core owns the cancelling. `core/cancellation.py` adds a `CancellationToken`: a
-thread-safe flag the caller passes into a long-running function, which checks it
-at every point where it can stop without leaving partial work behind and raises
-`OperationCancelled`. Cancelling is therefore cooperative, and each operation
-cleans up on its way out.
+MSHCore owns the cancelling. `MSHCore/cancellation.py` adds a
+`CancellationToken`: a thread-safe flag the caller passes into a long-running
+function, which checks it at every point where it can stop without leaving
+partial work behind and raises `OperationCancelled`. Cancelling is therefore
+cooperative, and each operation cleans up on its way out.
 
 It covers downloads and benchmarks, and only those — the two operations long
-enough to be worth stopping mid-flight. Installations are not cancellable: core
-runs an installer to completion, which is why `ollama_install` and
+enough to be worth stopping mid-flight. Installations are not cancellable:
+MSHCore runs an installer to completion, which is why `ollama_install` and
 `python_install_python` have no progress variant and no Cancel.
 
 `DownloadManager` holds a token of its own rather than a private flag, so its
@@ -455,7 +474,7 @@ result describes what actually happened rather than what was requested.
 
 ### What gets cleaned up
 
-| Cancelled operation | What core removes |
+| Cancelled operation | What MSHCore removes |
 | --- | --- |
 | Download | Every file the session produced — `.part` files *and* files that had already completed, since the queue is one unit of work that did not finish. Files that were on disk before the session started are kept. The download directory goes too, if this session created it and it ends up empty. |
 | Benchmark | The partial results are discarded, and the model the run loaded is unloaded, so the VRAM it was holding is released. |
@@ -467,7 +486,7 @@ operation is left running in memory. Its record stays on disk in its final
 `cancelled` state, which is what a later poll — or a reopened conversation — reads
 back.
 
-For a download, the session goes too. Core's `cancel` closes the manager — its
+For a download, the session goes too. MSHCore's `cancel` closes the manager — its
 queue is emptied and it refuses `add` and `start` afterwards — and `main.py`
 removes it from the session registry and calls `purge`, which releases the queue
 and the worker references. So after a cancellation there is no session, no job,
@@ -510,8 +529,8 @@ has already been cleaned up.
 ### Jobs and the store
 
 `gui/store.py` is the source of truth: one run is one JSON file under
-`Core/data/progress`, written through a temporary file and an atomic replace, so a
-reader sees either the previous snapshot or the new one and never a partial write.
+`MSHCore/data/progress`, written through a temporary file and an atomic replace, so
+a reader sees either the previous snapshot or the new one and never a partial write.
 A benchmark's measurements go in a second file under `results/`, written once as the
 job finishes, because a comparison result is far larger than the progress around it
 and must not be carried by a poll. Lookup is by exact identifier only — there is no
@@ -530,25 +549,25 @@ the result first, then the final snapshot — which is what advertises the resul
 and only then deregisters the job, so a reader never sees `result_available: true`
 with nothing to fetch, nor loses the job between memory and disk.
 
-A job keeps no log of its own. Core already writes an execution log entry for
+A job keeps no log of its own. MSHCore already writes an execution log entry for
 everything worth recording, and `logs_read` is how that is read back.
 
 A cancelling job passes through `cancelling` before `cancelled`: the request has
-been sent but core is still cleaning up. The panel shows that as its own badge and
-holds it, since a status poll already in flight when Cancel was pressed still
-describes a running operation and would otherwise flip the badge back to "running".
-A paused download stays `running` in core's own state and is reported with
-`paused: true`, which the panel renders as its own badge — the transfer is
-suspended, not over.
+been sent but MSHCore is still cleaning up. The panel shows that as its own badge
+and holds it, since a status poll already in flight when Cancel was pressed still
+describes a running operation and would otherwise flip the badge back to
+"running". A paused download stays `running` in MSHCore's own state and is
+reported with `paused: true`, which the panel renders as its own badge — the
+transfer is suspended, not over.
 
 ## Error handling
 
 Argument validation is handled by the SDK from each tool's type annotations, so
-a missing or mistyped argument fails before core is reached.
+a missing or mistyped argument fails before MSHCore is reached.
 
 Beyond that, the SDK treats any exception other than `ToolError` as a crash: the
 client gets a generic `Error executing tool <name>` and the real message stays on
-the server. Since core raises descriptive exceptions, the `surface_core_errors`
+the server. Since MSHCore raises descriptive exceptions, the `surface_core_errors`
 decorator re-raises them with the type name and message intact and the original
 chained as `__cause__`:
 
@@ -557,7 +576,7 @@ ToolError: Error executing tool download_add:
     PermissionError: Access denied: domain 'evil.example.com' is not allowed.
 ```
 
-Core exceptions are forwarded, never caught and replaced.
+MSHCore exceptions are forwarded, never caught and replaced.
 
 ## Claude Setup Utility
 

@@ -30,24 +30,12 @@ for every poll of the first.
 its own registrars.
 """
 
-from pathlib import Path
-import sys
-
-# This package imports core, and core imports itself as a top-level package, so
-# the Core submodule root has to be on sys.path first. main.py does this before
-# importing anything, but repeating it here — it is idempotent — keeps the gui
-# package importable on its own, for a REPL.
-_CORE_ROOT = Path(__file__).resolve().parent.parent / "Core"
-
-if str(_CORE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_CORE_ROOT))
-
-from .app import (  # noqa: E402
+from .app import (
     PROGRESS_URI,
     create_progress_app,
     register_progress_tools,
 )
-from .workers import note_download_ended  # noqa: E402
+from .workers import note_download_ended
 
 __all__ = [
     "PROGRESS_URI",

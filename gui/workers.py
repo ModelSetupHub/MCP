@@ -9,14 +9,14 @@ while a benchmark is still generating.
 Each worker owns its job's whole lifecycle and reaches exactly one terminal
 status:
 
-    try:      run the core function, classify what it returned  → completed/failed
+    try:      run the MSHCore function, classify what it returned  → completed/failed
     except:   OperationCancelled → cancelled, anything else     → failed
     finally:  the job is finished either way
 
 Where the progress figures come from is each worker's business and stops here.
 Downloads read ``DownloadManager.get_status``, which is a real live API. Benchmarks
-tail the execution log, because core returns nothing until every prompt has run —
-if core later grows a progress callback, only ``_run_benchmark`` changes.
+tail the execution log, because MSHCore returns nothing until every prompt has run —
+if MSHCore later grows a progress callback, only ``_run_benchmark`` changes.
 """
 
 from __future__ import annotations
@@ -26,15 +26,16 @@ import threading
 import time
 from typing import Any
 
-# Core is imported as the top-level `core` package, the same way core imports
-# itself. `Core.core.x` resolves to a second, distinct copy of the same file with
-# its own copy of every class — so a token handed to core and the
-# OperationCancelled caught back from it would come from different copies, and
-# `except OperationCancelled` would silently miss the cancellation.
-from core import logging as core_logging
-from core.cancellation import CancellationToken, OperationCancelled
-from core.download_manager.manager import DownloadManager
-from core.ollama import experiment
+# MSHCore is installed with pip and imported as a top-level package, the same
+# way the server's other modules import it. Mixing spellings — say, `MSHCore.x`
+# here but `Core.MSHCore.x` in main.py — would put two distinct copies of every
+# class in memory, so a token handed to MSHCore and the OperationCancelled caught
+# back from it would come from different copies, and `except
+# OperationCancelled` would silently miss the cancellation.
+from MSHCore import logging as core_logging
+from MSHCore.cancellation import CancellationToken, OperationCancelled
+from MSHCore.download_manager.manager import DownloadManager
+from MSHCore.ollama import experiment
 
 from .jobs import (
     CANCELLED,
@@ -52,14 +53,14 @@ from .logtail import LogTail
 # How often a worker reads its progress source.
 POLL_SECONDS = 0.4
 
-# How long a cancellation waits for core to finish cleaning up.
+# How long a cancellation waits for MSHCore to finish cleaning up.
 CANCEL_TIMEOUT = 60.0
 
 # How long a download worker waits for the manager's thread to exit after a
 # cancellation, so the final snapshot describes the state after cleanup.
 WORKER_STOP_TIMEOUT = 30.0
 
-# How long a benchmark waits for its log reader to drain. Core writes the last
+# How long a benchmark waits for its log reader to drain. MSHCore writes the last
 # prompt's entry immediately before returning, routinely after the last read.
 DRAIN_TIMEOUT = 5.0
 
@@ -127,7 +128,7 @@ def format_speed(bytes_per_second: float | None) -> str | None:
     """Format a transfer rate for the panel.
 
     Args:
-        bytes_per_second: Rate core measured, or None when it has none yet.
+        bytes_per_second: Rate MSHCore measured, or None when it has none yet.
 
     Returns:
         str | None: Rate per second, or None when there is nothing to show —
@@ -201,7 +202,7 @@ def _run_download(job: Job, manager: DownloadManager, session_id: str) -> None:
             time.sleep(POLL_SECONDS)
 
         # A cancellation returns before the manager's thread has exited, and
-        # core's cleanup runs on that thread. Waiting means the final snapshot
+        # MSHCore's cleanup runs on that thread. Waiting means the final snapshot
         # describes the state after the files were removed, not during.
         manager.wait_until_stopped(timeout=WORKER_STOP_TIMEOUT)
 
@@ -299,7 +300,7 @@ def _apply_download_status(job: Job, status: dict) -> None:
             else state
         )
 
-        # Core measures the rate per item, so the row carries its own and the
+        # MSHCore measures the rate per item, so the row carries its own and the
         # chip under the bar shows whichever row is transferring.
         speed = format_speed(item.get("speed")) if state == "downloading" else None
 
@@ -412,7 +413,7 @@ def start_benchmark(
 
     One entry point for both shapes. A single test is one configuration with one
     row per prompt; a comparison is several, with one row per configuration. Both
-    call ``experiment.compare_tests``, so core does the normalisation either way
+    call ``experiment.compare_tests``, so MSHCore does the normalisation either way
     and this layer has one result shape to classify.
 
     Args:
@@ -440,7 +441,7 @@ def start_benchmark(
         ),
     )
 
-    # The rows exist before core runs, so the very first poll shows the shape of
+    # The rows exist before MSHCore runs, so the very first poll shows the shape of
     # the work rather than an empty indeterminate bar.
     if single:
         job.add_steps([f"prompt {index}" for index in range(1, len(prompts) + 1)])
@@ -523,13 +524,13 @@ def _run_benchmark(
         job.finish(FAILED, message="The benchmark failed.", error=str(error))
         return
 
-    # Core writes the last prompt's entry just before returning, so the reader is
+    # MSHCore writes the last prompt's entry just before returning, so the reader is
     # drained before the rows are settled from the result.
     _stop_reader(stop, reader)
 
     _close_benchmark_steps(job, result=result, single=single)
 
-    # Core records a failed prompt as a result entry rather than raising, so a run
+    # MSHCore records a failed prompt as a result entry rather than raising, so a run
     # against a model that does not exist returns normally with every prompt
     # failed. Classifying the result is what turns that into a failure.
     error = _benchmark_error(result)
@@ -549,10 +550,10 @@ def _run_benchmark(
 
 
 def _business_result(result: dict, single: bool) -> dict:
-    """Shape core's return value as the benchmark's deliverable.
+    """Shape MSHCore's return value as the benchmark's deliverable.
 
     A single test is one configuration, so its result is unwrapped to the shape
-    ``ollama_run_test`` returns. A comparison keeps core's own shape.
+    ``ollama_run_test`` returns. A comparison keeps MSHCore's own shape.
 
     Args:
         result: Return value of ``experiment.compare_tests``.
@@ -618,7 +619,7 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
 
     The rows advance from the execution log while the run is in flight, which is
     best-effort: an entry can be written after the last read, and a prompt that
-    failed before core logged it produces no entry at all. The result is
+    failed before MSHCore logged it produces no entry at all. The result is
     authoritative, so it closes every row once the run is over.
 
     Args:
@@ -645,7 +646,7 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
         return
 
     # One row per configuration, in the order they were queued — which is the
-    # order core runs and returns them in.
+    # order MSHCore runs and returns them in.
     for index in range(job.step_count()):
         if index >= len(tests):
             job.finish_step(index, state=SKIPPED, detail="not run")
@@ -668,15 +669,15 @@ def _tail_benchmark(
     prompt_count: int,
     single: bool,
 ) -> None:
-    """Advance a benchmark's rows from the entries core logs per prompt.
+    """Advance a benchmark's rows from the entries MSHCore logs per prompt.
 
     This is the only place the execution log is read, and nothing above it knows
-    that is where the figures come from. If core gains a progress callback, this
+    that is where the figures come from. If MSHCore gains a progress callback, this
     function is what it replaces.
 
     Args:
         job: Job to update.
-        stop: Set once the core call has returned.
+        stop: Set once the MSHCore call has returned.
         names: Configuration names, in row order.
         prompt_count: Prompts per configuration.
         single: Whether the rows are prompts rather than configurations.
@@ -764,7 +765,7 @@ def _drain(
 # ============================================================
 
 def cancel(job: Job) -> dict:
-    """Cancel a job and wait for core to finish cleaning up.
+    """Cancel a job and wait for MSHCore to finish cleaning up.
 
     Args:
         job: Job to cancel.
@@ -772,7 +773,7 @@ def cancel(job: Job) -> dict:
     Returns:
         dict: Final snapshot, taken after the cleanup so it describes what
         happened rather than what was asked for. ``cleanup_complete`` is false only
-        when the wait ran out with core still working.
+        when the wait ran out with MSHCore still working.
     """
     requested = job.request_cancel("Cancelled from the progress panel")
     complete = job.wait(CANCEL_TIMEOUT) if requested else True
@@ -783,7 +784,7 @@ def cancel(job: Job) -> dict:
 
     if not complete:
         snapshot["message"] = (
-            "Cancelled; core is still cleaning up. The task will not resume."
+            "Cancelled; MSHCore is still cleaning up. The task will not resume."
         )
 
     return snapshot

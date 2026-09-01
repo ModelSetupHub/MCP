@@ -521,11 +521,11 @@ class Job:
         """Ask the operation to stop.
 
         The status stays ``running`` with ``cancelling`` set, and becomes
-        ``cancelled`` only once core has actually stopped and cleaned up — which
+        ``cancelled`` only once MSHCore has actually stopped and cleaned up — which
         the worker reports by calling ``finish``.
 
         Args:
-            reason: Explanation passed to core and shown on the panel.
+            reason: Explanation passed to MSHCore and shown on the panel.
 
         Returns:
             bool: True if this call requested the cancellation, False if the job
@@ -572,7 +572,7 @@ class Job:
     def sync_paused(self, paused: bool) -> None:
         """Adopt the operation's own paused flag.
 
-        Core is the authority: a download can also be suspended by the manager's
+        MSHCore is the authority: a download can also be suspended by the manager's
         keyboard listener, not only by this panel.
 
         Args:

@@ -1,6 +1,6 @@
 """Persistent job store — the single source of truth for progress.
 
-One run is one JSON file under ``Core/data/progress``, named after the job's
+One run is one JSON file under ``MSHCore/data/progress``, named after the job's
 identifier. Writing goes through a temporary file and an atomic replace, so a
 reader either sees the previous snapshot or the new one, never a partial write.
 
@@ -22,7 +22,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from core.logging import get_log_file_info
+from MSHCore.logging import get_log_file_info
 
 DIRECTORY_NAME = "progress"
 RESULTS_NAME = "results"
@@ -40,7 +40,7 @@ def directory() -> Path:
     """Return the records directory, creating it if needed.
 
     Returns:
-        Path: ``Core/data/progress``, alongside the execution log core writes.
+        Path: ``MSHCore/data/progress``, alongside the execution log MSHCore writes.
     """
     path = get_log_file_info()["path"].parent / DIRECTORY_NAME
     path.mkdir(parents=True, exist_ok=True)
@@ -52,7 +52,7 @@ def results_directory() -> Path:
     """Return the results directory, creating it if needed.
 
     Returns:
-        Path: ``Core/data/progress/results``.
+        Path: ``MSHCore/data/progress/results``.
     """
     path = directory() / RESULTS_NAME
     path.mkdir(parents=True, exist_ok=True)
