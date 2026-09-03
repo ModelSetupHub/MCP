@@ -150,20 +150,29 @@ download_start_with_progress, ollama_run_test_with_progress and
 ollama_compare_tests_with_progress. Track them with
 progress_get_status(progress_id), which is a fast, non-blocking read of a
 recorded snapshot: status is 'starting' or 'running' while work continues,
-then 'completed', 'failed' or 'cancelled'. It draws nothing, so poll as often
-as needed; the operation's own progress bar updates itself. It answers after
-the operation ends and after this server restarts. An unknown id reports
-found=false and is never answered with another operation's progress.
+then 'completed', 'failed' or 'cancelled'. It answers after the operation
+ends and after this server restarts. An unknown id reports found=false and
+is never answered with another operation's progress.
 
-The two kinds of background operation end differently:
+Both kinds run without you, and benchmarks follow the same behaviour as
+downloads: after starting either one, say that it has started, then end the
+turn and go to sleep. Never hold the turn open polling in a loop — minutes
+of polling stall the conversation, the operation runs to completion without
+you either way, and its progress bar keeps updating itself. When the user
+calls again, wake up, call progress_get_status once with the progress_id,
+and take it from there.
 
-- Downloads are fire-and-monitor. Starting the transfer is the whole job and
-  there is nothing to collect. Poll only when the outcome matters.
-- Benchmarks return an acknowledgement containing no measurements. Poll until
-  the status is terminal, then call benchmark_get_result(progress_id) with the
-  same id. Only then are the results available: do not describe timings,
-  compare configurations or recommend settings before retrieving them. A
-  failed or cancelled run produces no measurements and says so.
+The two kinds differ in what waking up means:
+
+- Downloads have nothing to collect: starting the transfer is the whole
+  job, and the poll only confirms the outcome.
+- Benchmarks return an acknowledgement containing no measurements. On
+  waking, call progress_get_status with the same id until the status is
+  terminal, then call benchmark_get_result(progress_id) with it: that reads
+  the measurements back from the file the finished run stored on disk, and
+  it is the only place they exist. Until then, do not describe timings,
+  compare configurations or recommend settings — and a failed or cancelled
+  run produces no measurements and says so.
 
 Use the synchronous ollama_run_test or ollama_compare_tests when you want the
 measurements from a single call and no progress bar.
@@ -184,7 +193,8 @@ Cancelling a download also removes its session: the id becomes free, and
 downloading the same files again means calling download_create_session and
 download_add again. A cancelled session refuses further use. Starting a
 session that is already downloading is rejected rather than started twice —
-poll the progress_id named in the error, or cancel it first.
+end the turn and go to sleep; when the user calls again, poll the
+progress_id named in the error, or cancel it first.
 
 ## Sequence rules
 

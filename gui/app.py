@@ -161,12 +161,13 @@ def register_progress_tools(server: Any) -> None:
             "message, per-step rows, and an error when there is one. For a "
             "benchmark, 'result_available': true on a completed run means the "
             "measurements are ready to fetch with benchmark_get_result; the "
-            "measurements are never included here. Poll this until the status is "
-            "terminal; polling costs nothing and adds nothing to the conversation, "
-            "and the operation's own progress bar keeps updating itself either way. "
-            "Answers while the operation runs and afterwards, including after this "
-            "server restarts. An unknown id reports found=false rather than another "
-            "operation's progress."
+            "measurements are never included here. Do not poll in a held-open "
+            "loop: after starting an operation, end the turn and go to sleep, "
+            "then call this when the user next prompts, repeating only if the "
+            "status is not yet terminal — the operation's own progress bar keeps "
+            "updating itself either way. Answers while the operation runs and "
+            "afterwards, including after this server restarts. An unknown id "
+            "reports found=false rather than another operation's progress."
         ),
         annotations=ToolAnnotations(
             read_only_hint=True,
@@ -380,7 +381,8 @@ def _no_result_reason(snapshot: dict) -> str:
 
     if status in ("starting", "running"):
         return (
-            "This benchmark is still running. Poll progress_get_status with this "
+            "This benchmark is still running. End the turn and go to sleep; when "
+            "the user calls again, poll progress_get_status with this "
             "progress_id until its status is completed, then call this again."
         )
 
@@ -601,11 +603,13 @@ def _started(job: Job, **extra: Any) -> dict:
 BENCHMARK_CONTRACT = (
     "This benchmark has started and has NOT completed. This response is an "
     "acknowledgement, not the benchmark result, and it contains no measurements. "
-    "Poll progress_get_status with this progress_id until its status is "
-    "'completed', 'failed' or 'cancelled'. On 'completed', call "
-    "benchmark_get_result with the same progress_id to obtain the measurements, "
-    "and use those to answer the user. Do not report the benchmark as done, and do "
-    "not describe its results, before retrieving them."
+    "Say that it has started, then end the turn and go to sleep — do not hold "
+    "the turn open polling. When the user calls again, poll progress_get_status "
+    "with this progress_id until its status is 'completed', 'failed' or "
+    "'cancelled'. On 'completed', call benchmark_get_result with the same "
+    "progress_id to read the measurements the run stored on disk, and use those "
+    "to answer the user. Do not report the benchmark as done, and do not "
+    "describe its results, before retrieving them."
 )
 
 
@@ -623,7 +627,8 @@ def _benchmark_started(job: Job, **extra: Any) -> dict:
         **_started(job, **extra),
         "result_available": False,
         "next_step": (
-            f"Poll progress_get_status(progress_id='{job.id}') until it reports a "
+            f"End the turn; when the user calls again, poll "
+            f"progress_get_status(progress_id='{job.id}') until it reports a "
             f"terminal status, then call "
             f"benchmark_get_result(progress_id='{job.id}')."
         ),
@@ -711,9 +716,11 @@ def _register_benchmarks(apps: Apps) -> None:
             "running it in the background and showing a live progress bar in the "
             "conversation with one row per prompt. Returns immediately with a "
             "progress_id — an acknowledgement that the benchmark has started, NOT "
-            "its results, which do not exist yet. Poll progress_get_status with "
-            "that id until the status is 'completed', 'failed' or 'cancelled', then "
-            "call benchmark_get_result with the same id to obtain the measurements. "
+            "its results, which do not exist yet. Say that it has started, end the "
+            "turn and go to sleep; when the user calls again, poll "
+            "progress_get_status with that id until the status is 'completed', "
+            "'failed' or 'cancelled', then call benchmark_get_result with the same "
+            "id to obtain the measurements. "
             "The benchmark is not finished, and its results cannot be reported, "
             "until that retrieval. Prefer this whenever a human is watching, since "
             "each prompt is a full generation; use the synchronous ollama_run_test "
@@ -761,10 +768,12 @@ def _register_benchmarks(apps: Apps) -> None:
             "parameters, running it in the background and showing a live progress "
             "bar in the conversation with one row per configuration. Returns "
             "immediately with a progress_id — an acknowledgement that the "
-            "comparison has started, NOT its results, which do not exist yet. Poll "
-            "progress_get_status with that id until the status is 'completed', "
-            "'failed' or 'cancelled', then call benchmark_get_result with the same "
-            "id to obtain the side-by-side measurements. The comparison is not "
+            "comparison has started, NOT its results, which do not exist yet. Say "
+            "that it has started, end the turn and go to sleep; when the user "
+            "calls again, poll progress_get_status with that id until the status "
+            "is 'completed', 'failed' or 'cancelled', then call "
+            "benchmark_get_result with the same id to obtain the side-by-side "
+            "measurements. The comparison is not "
             "finished, and no configuration can be recommended, until that "
             "retrieval. Total time is the prompt count multiplied by the "
             "configuration count, which is why this runs asynchronously; use the "
