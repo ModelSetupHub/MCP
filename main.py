@@ -53,6 +53,13 @@ from MSHCore import logging as core_logging  # noqa: E402
 from MSHCore.system import hardware, scanner  # noqa: E402
 from MSHCore.download_manager.manager import DownloadManager  # noqa: E402
 
+# Where downloads land unless a tool call names somewhere else. Read from
+# MSHCore so this layer cannot disagree with the manager's own default: both are
+# %LOCALAPPDATA%\MSH\downloads, a per-user directory that needs no elevation.
+from MSHCore.paths import DOWNLOADS_DIRECTORY  # noqa: E402
+
+DEFAULT_DOWNLOAD_DIRECTORY = str(DOWNLOADS_DIRECTORY)
+
 # The whitelist lives in its own module so the manager and the downloader
 # validate against one list; it is read from there rather than through either of
 # them. `allowed_sources` renders it for a client, wildcard subdomains included.
@@ -1680,8 +1687,10 @@ def register_download_tools(server: MCPServer) -> None:
             "starts the transfer with a live progress bar in one call, so "
             "never combine it with download_create_session, download_add or "
             "download_start. url must be http or https on a host from "
-            "download_list_allowed_domains. destination_directory is created "
-            "if missing. Returns immediately by default with a ticket "
+            "download_list_allowed_domains. destination_directory defaults to "
+            "%LOCALAPPDATA%\\MSH\\downloads and is created with its parents if "
+            "missing; a relative path resolves against this server's working "
+            "directory. Returns immediately by default with a ticket "
             "carrying 'download_id' (a progress_id — pass it only to "
             "progress_get_status, progress_pause or progress_cancel), "
             "'session_id' (pass it only to the download_* queue tools if the "
@@ -1707,7 +1716,7 @@ def register_download_tools(server: MCPServer) -> None:
     @surface_core_errors
     def download_file(
         url: str,
-        destination_directory: str = "data/downloads",
+        destination_directory: str = DEFAULT_DOWNLOAD_DIRECTORY,
         filename: str | None = None,
         max_retries: int = 3,
         wait: bool = False,
@@ -1718,7 +1727,7 @@ def register_download_tools(server: MCPServer) -> None:
         Args:
             url: HTTP or HTTPS URL on an allowed domain.
             destination_directory: Directory the file is written into, created
-                if needed.
+                if needed. Defaults to %LOCALAPPDATA%\\MSH\\downloads.
             filename: Optional destination filename; taken from the URL when
                 omitted, and numbered if that name is already taken.
             max_retries: Retry attempts before the transfer is marked failed.
@@ -1821,8 +1830,9 @@ def register_download_tools(server: MCPServer) -> None:
             "is the handle every other download_* tool takes, and it is NOT a "
             "progress_id, so never pass it to progress_get_status. Fails if "
             "that name is already in use — list the open ones with "
-            "download_list_sessions. download_directory is created if missing "
-            "and is where completed files land; relative paths resolve "
+            "download_list_sessions. download_directory is where completed "
+            "files land; it defaults to %LOCALAPPDATA%\\MSH\\downloads, is "
+            "created with its parents if missing, and a relative path resolves "
             "against this server's working directory. max_retries is total "
             "attempts per file, not extra ones. Returns the new session's "
             "initial status, with an empty 'downloads' list."
@@ -1837,7 +1847,7 @@ def register_download_tools(server: MCPServer) -> None:
     @surface_core_errors
     def download_create_session(
         session_id: str,
-        download_directory: str = "data/downloads",
+        download_directory: str = DEFAULT_DOWNLOAD_DIRECTORY,
         max_retries: int = 3,
     ) -> dict:
         """Create a download session.
@@ -1845,6 +1855,7 @@ def register_download_tools(server: MCPServer) -> None:
         Args:
             session_id: Identifier for later calls.
             download_directory: Destination directory for completed files.
+                Defaults to %LOCALAPPDATA%\\MSH\\downloads.
             max_retries: Retry attempts per file before it is marked failed.
 
         Returns:
@@ -2368,9 +2379,10 @@ def register_logging_tools(server: MCPServer) -> None:
             "before logs_read to size the request: the entry count is what "
             "tells you whether an uncapped read is safe or line_count is "
             "required to avoid overflowing the context. Read-only in effect, "
-            "though it does create the log's parent directory if absent. "
-            "Returns one dict with exactly 'path' (the log's absolute path, "
-            "for reading or archiving the raw file outside these tools), "
+            "though it does create the log's directory if absent. Returns one "
+            "dict with exactly 'path' (the log's absolute path, which is "
+            "%LOCALAPPDATA%\\MSH\\logs\\executions.log, for reading or "
+            "archiving the raw file outside these tools), "
             "'line_count' (physical lines, which can slightly exceed the "
             "number of entries logs_read yields because unparseable lines are "
             "counted here and skipped there) and 'size_bytes'. A log that has "

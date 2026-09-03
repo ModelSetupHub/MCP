@@ -1,8 +1,9 @@
 """Persistent job store — the single source of truth for progress.
 
-One run is one JSON file under ``MSHCore/data/progress``, named after the job's
-identifier. Writing goes through a temporary file and an atomic replace, so a
-reader either sees the previous snapshot or the new one, never a partial write.
+One run is one JSON file under ``%LOCALAPPDATA%\\MSH\\logs\\progress``, named
+after the job's identifier. Writing goes through a temporary file and an atomic
+replace, so a reader either sees the previous snapshot or the new one, never a
+partial write.
 
 A run that produces a business result — a benchmark's measurements — keeps it in a
 second file under ``results/``, written once when the job finishes. It lives apart
@@ -40,7 +41,8 @@ def directory() -> Path:
     """Return the records directory, creating it if needed.
 
     Returns:
-        Path: ``MSHCore/data/progress``, alongside the execution log MSHCore writes.
+        Path: ``%LOCALAPPDATA%\\MSH\\logs\\progress``, alongside the
+        execution log MSHCore writes.
     """
     path = get_log_file_info()["path"].parent / DIRECTORY_NAME
     path.mkdir(parents=True, exist_ok=True)
@@ -52,7 +54,7 @@ def results_directory() -> Path:
     """Return the results directory, creating it if needed.
 
     Returns:
-        Path: ``MSHCore/data/progress/results``.
+        Path: ``%LOCALAPPDATA%\\MSH\\logs\\progress\\results``.
     """
     path = directory() / RESULTS_NAME
     path.mkdir(parents=True, exist_ok=True)
