@@ -35,11 +35,12 @@ from .app import (
     create_progress_app,
     register_progress_tools,
 )
-from .workers import note_download_ended
+from .workers import note_download_ended, start_download
 
 __all__ = [
     "PROGRESS_URI",
     "create_progress_app",
     "register_progress_tools",
     "note_download_ended",
+    "start_download",
 ]

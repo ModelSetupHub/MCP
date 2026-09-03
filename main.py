@@ -2,7 +2,10 @@
 
 Serves the ``MSHCore`` package (the ``Core`` submodule) over the Model Context
 Protocol. Every tool is a thin pass-through to an existing MSHCore function; no
-business logic lives here.
+business logic lives here. The tool ``description`` strings and
+``INSTRUCTIONS`` below are the model's only guidance, so they carry each
+tool's prerequisites, identifier provenance, side effects and pagination
+limits.
 
 MSHCore must be installed with pip before the server can start (see
 README.md): from the repository root run ``python utils/install_mshcore.py``
@@ -29,6 +32,7 @@ import functools
 from pathlib import Path
 import threading
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import MCPServerError, ToolError
@@ -51,18 +55,20 @@ from MSHCore.download_manager.manager import DownloadManager  # noqa: E402
 
 # The whitelist lives in its own module so the manager and the downloader
 # validate against one list; it is read from there rather than through either of
-# them.
-from MSHCore.download_manager.sources import ALLOWED_DOMAINS  # noqa: E402
+# them. `allowed_sources` renders it for a client, wildcard subdomains included.
+from MSHCore.download_manager.sources import allowed_sources  # noqa: E402
 from MSHCore.ollama import experiment, model, runtime  # noqa: E402
 from MSHCore.python import environment, installer, tools  # noqa: E402
 
 # The in-chat progress panel, the tools that draw it, and the plain tools that
 # read one afterwards. Every frontend file lives under gui/; this layer only hands
-# it a way to resolve a download session.
+# it a way to resolve a download session. `start_download` is the same worker the
+# panel's own tool uses, so the one-call facade below gets a progress bar too.
 from gui import (  # noqa: E402
     create_progress_app,
     note_download_ended,
     register_progress_tools,
+    start_download,
 )
 
 SERVER_NAME = "modelsetuphub"
@@ -70,88 +76,131 @@ SERVER_TITLE = "ModelSetupHub"
 SERVER_VERSION = "0.1.0"
 
 INSTRUCTIONS = """\
-ModelSetupHub manages local AI environments on this machine: hardware
-discovery, the Ollama service and its models, model benchmarking, Python
-environments and scripts, and downloads from a fixed set of allowed domains.
+ModelSetupHub manages local AI environments on the machine this server runs
+on: hardware discovery, the Ollama service and its models, model
+benchmarking, Python interpreters, packages and scripts, and downloads
+restricted to a fixed domain whitelist.
 
-Suggested order of operations:
+## Choosing a tool
 
-- Before recommending a model, call system_scan (or system_get_gpu_info and
-  system_get_storage_info for a quick check) to see what the hardware supports.
-- Ollama tools need the service running: check ollama_get_status and call
-  ollama_start if needed.
-- To compare generation parameters, use ollama_run_test or
-  ollama_compare_tests, which apply settings per request. Only use
-  ollama_configure_model when a persistent model variant is wanted.
-- Downloads are asynchronous: create a session, queue URLs, start it, then poll
-  download_get_status. Only the domains listed by
-  download_list_allowed_domains are accepted.
-- MSHCore logs every significant operation; logs_read surfaces detail that a
-  tool's return value may not include, especially after a failure. Pass
-  line_count to read only the newest entries, and call logs_get_file_info first
-  to see how large the log has grown.
-- When Ollama itself misbehaves — the service will not start, a model fails to
-  load, the GPU is not picked up — its own log files carry detail MSHCore never
-  sees: call list_ollama_logs for the available file names with their sizes and
-  line counts, then read_ollama_logs with the one you need, using start_line and
-  end_line to page through a large file.
-- Before overwriting a script with python_edit_script, read it with
-  python_read_script: the edit replaces the whole file and the previous content
-  is not recoverable.
+- One hardware metric: system_get_gpu_info, system_get_storage_info,
+  system_get_memory_info or system_get_cuda_version. Whole profile:
+  system_scan, which on Windows makes eight subprocess calls and can take
+  tens of seconds — do not call it for a single number. system_scan reports
+  memory and storage in GiB; the narrow tools report raw bytes.
+- Generate text: ollama_run_model. Measure speed: ollama_run_test. Compare
+  parameter sets: ollama_compare_tests. Only ollama_configure_model creates a
+  persistent model variant; the benchmark tools apply parameters per request
+  and create nothing.
+- One file from the web: download_file, the primary download tool.
+- Several files as one unit of work: the session ceremony below.
+- Diagnose a failure: logs_read for anything MSHCore did, list_ollama_logs
+  then read_ollama_logs when Ollama itself is at fault.
 
-Downloads and benchmarks have a '_with_progress' variant that runs the work in
-the background and renders a live progress bar in the conversation. Both return a
-progress_id immediately, and progress_get_status(progress_id) reports the state:
-'starting' or 'running' while the work continues, then 'completed', 'failed' or
-'cancelled'. That call is fast and never blocks. An unknown id reports
-found=false; it is never answered with another operation. Installations have no
-progress variant.
+## Single-call tools versus the download queue
 
-One operation is one progress_id and one progress bar. The bar belongs to the
-starting call and updates itself; progress_get_status only reads the state and
-draws nothing, so polling it as often as needed adds no second bar and costs
-nothing. Always poll with the progress_id the starting tool returned — never start
-the operation again to check on it.
+Every tool other than the download session tools finishes its whole job in
+one call. The download session tools are stateful and split one job across
+several calls; nothing is transferred until the queue is started:
 
-The two kinds of operation are asked for different things, so they end
-differently:
+    download_create_session       create an empty named queue
+    download_add, download_add_many
+                                  enqueue URLs only, transfer nothing
+    download_start_with_progress  begin the transfer (or download_start)
 
-- download_start_with_progress is fire-and-monitor. Starting the transfer is the
-  whole of the tool's job, so there is nothing to collect afterwards. Continue
-  with other work and poll progress_get_status only when the outcome matters.
-- ollama_run_test_with_progress and ollama_compare_tests_with_progress are asked
-  for measurements, and starting them is not delivering those. Their response is
-  an acknowledgement carrying a progress_id, with no results in it. Poll
-  progress_get_status until the status is terminal, and on 'completed' call
-  benchmark_get_result(progress_id) to obtain the measurements. Only then is the
-  benchmark done: do not describe results, compare configurations or recommend
-  settings before retrieving them. A failed or cancelled run produces no
-  measurements, and benchmark_get_result will say so.
+Skipping the start leaves a queue that never runs. download_file performs all
+three steps itself, so never pair it with them.
 
-Prefer the plain ollama_run_test or ollama_compare_tests when the measurements are
-wanted from a single call and no progress bar is needed.
+## Two kinds of identifier — never interchange them
 
-Two different controls act on a running operation, both taking its progress_id:
+- session_id names a download queue. You choose it when calling
+  download_create_session. Every download_* tool takes it, and only those
+  tools accept it. Format: whatever string you picked, or 'auto-<8 hex>' when
+  download_file generated one.
+- progress_id names one background operation. A tracked tool mints it and
+  returns it; you never choose it. Only progress_get_status,
+  benchmark_get_result, progress_cancel and progress_pause accept it. Format:
+  'download-<date>-<time>-<8 hex>' or 'benchmark-<date>-<time>-<8 hex>'.
 
-- progress_cancel ends the task and has MSHCore undo it — partial and completed
-  downloads are deleted, a loaded model is unloaded — leaving a 'cancelled'
-  entry in the execution log, which logs_read will show. It applies to
-  downloads and benchmarks alike, and cannot be undone.
-- progress_pause stops a download without cancelling it: the queue and the bytes
-  already fetched are kept, and calling it again resumes from where it left off.
-  Downloads only.
+download_file returns both, and its progress_id is under the key
+'download_id'. Passing a session_id to progress_get_status reports
+found=false; passing a progress_id to a download_* tool reports an unknown
+session. Never call the starting tool again in order to obtain an id — the
+first call already returned it, and a second call starts a second operation.
 
-Cancelling a download removes the session too: its id becomes free, and
+## Long-running operations and progress
+
+Immediate: every read-only tool, and every download_* queue-control tool.
+
+Blocking until finished, with no progress reporting: ollama_run_model,
+ollama_run_test, ollama_compare_tests, ollama_start, ollama_stop,
+ollama_install, python_run_script, python_install_packages,
+python_create_environment and python_install_python. None has a timeout,
+several take minutes, and installers have no progress variant at all.
+
+Background, returning a progress_id at once: download_file,
+download_start_with_progress, ollama_run_test_with_progress and
+ollama_compare_tests_with_progress. Track them with
+progress_get_status(progress_id), which is a fast, non-blocking read of a
+recorded snapshot: status is 'starting' or 'running' while work continues,
+then 'completed', 'failed' or 'cancelled'. It draws nothing, so poll as often
+as needed; the operation's own progress bar updates itself. It answers after
+the operation ends and after this server restarts. An unknown id reports
+found=false and is never answered with another operation's progress.
+
+The two kinds of background operation end differently:
+
+- Downloads are fire-and-monitor. Starting the transfer is the whole job and
+  there is nothing to collect. Poll only when the outcome matters.
+- Benchmarks return an acknowledgement containing no measurements. Poll until
+  the status is terminal, then call benchmark_get_result(progress_id) with the
+  same id. Only then are the results available: do not describe timings,
+  compare configurations or recommend settings before retrieving them. A
+  failed or cancelled run produces no measurements and says so.
+
+Use the synchronous ollama_run_test or ollama_compare_tests when you want the
+measurements from a single call and no progress bar.
+
+## Controlling a running operation
+
+Two controls take a progress_id:
+
+- progress_cancel ends the operation and has MSHCore undo it — partial and
+  completed downloads are deleted, a loaded model is unloaded — and records a
+  'cancelled' entry that logs_read will show. Applies to downloads and
+  benchmarks. Cannot be undone.
+- progress_pause suspends a download and keeps the queue, the fetched files
+  and the partial data; calling it again resumes. Downloads only; a benchmark
+  reports pause_action='unavailable'.
+
+Cancelling a download also removes its session: the id becomes free, and
 downloading the same files again means calling download_create_session and
-download_add again. Do not try to restart or add to a cancelled session — it
-will refuse.
+download_add again. A cancelled session refuses further use. Starting a
+session that is already downloading is rejected rather than started twice —
+poll the progress_id named in the error, or cancel it first.
 
-Starting a download that is already downloading is rejected rather than started
-twice; poll the progress bar named in the error, or cancel it first.
+## Sequence rules
 
-Tools that delete models, environments, script files, or queued downloads are
-irreversible and are annotated as destructive. Confirm the target before
-calling them.
+- Recommend a model only after reading the hardware: system_get_gpu_info for
+  VRAM, system_get_storage_info for free space. Do not infer either.
+- Call ollama_get_status before any other Ollama tool, and ollama_start when
+  it reports running=false. Every model tool needs the service up.
+- Confirm a model is installed with ollama_list_models before benchmarking,
+  configuring or running it; the tools fail on an unknown name.
+- Never call python_edit_script or python_create_script without first reading
+  the target with python_read_script when it may already exist. Both write the
+  whole file, and edit discards the previous content unrecoverably.
+- Check download_list_allowed_domains before queueing a URL from an unfamiliar
+  host. A rejected domain raises before anything is queued.
+- On any failure, read logs_get_file_info, then logs_read with line_count set
+  and level='ERROR' — a tool's error message is often shorter than the log
+  entry behind it. For an Ollama service, model-load or GPU-detection failure,
+  call list_ollama_logs and then read_ollama_logs with a line range.
+
+Tools that delete models, environments, script files, packages, or downloaded
+files are irreversible and annotated destructive. Verify the target — with
+ollama_list_models, python_list_packages, python_read_script or
+download_get_status — before calling them.
 """
 
 READ_ONLY = ToolAnnotations(
@@ -208,11 +257,25 @@ def register_system_tools(server: MCPServer) -> None:
         name="system_scan",
         title="Scan system hardware",
         description=(
-            "Collect the full machine profile: operating system, CPU model and "
-            "instruction-set features, RAM capacity with physical module "
-            "layout, NVIDIA GPUs with VRAM and CUDA version, and per-drive "
-            "storage capacity. Shells out to PowerShell and nvidia-smi, so it "
-            "takes a few seconds; prefer the narrower tools for a single metric."
+            "Collect the entire machine profile in one call. Secondary tool: "
+            "use it only when several categories are needed at once, and "
+            "prefer system_get_gpu_info, system_get_storage_info, "
+            "system_get_memory_info or system_get_cuda_version for a single "
+            "metric. No prerequisites. Read-only; writes one execution-log "
+            "entry and changes nothing else. Shells out eight times on "
+            "Windows (six PowerShell queries, two nvidia-smi), each with its "
+            "own five-second timeout, so it can block for tens of seconds. "
+            "Returns one dict with exactly these keys: 'system' (OS name, "
+            "version, build, architecture, Python version), 'cpu' (model, "
+            "cores, threads, clocks, instruction-set 'features'), 'memory' "
+            "('total_gb', 'available_gb', 'used_gb', 'usage_percent', "
+            "physical 'modules', 'channels'), 'gpu' ('count', 'devices', "
+            "'cuda_version'), and 'storage' (one entry per drive with "
+            "'total_gb', 'used_gb', 'free_gb'). Memory and storage figures "
+            "here are GiB rounded to two decimals, not bytes — the narrow "
+            "tools return raw bytes instead. The response is a fixed size "
+            "with no pagination; it grows only with the number of drives, RAM "
+            "modules and GPUs."
         ),
         annotations=READ_ONLY,
     )
@@ -224,9 +287,14 @@ def register_system_tools(server: MCPServer) -> None:
         name="system_get_memory_info",
         title="Get RAM usage",
         description=(
-            "Report total, available and used system RAM in bytes plus the "
-            "usage percentage. Reads in-process counters, so it returns "
-            "immediately."
+            "Report current system RAM usage. Primary tool for a memory "
+            "check; system_scan also returns this but costs subprocess calls. "
+            "No prerequisites. Reads in-process counters, so it makes no "
+            "subprocess call, returns immediately, and mutates nothing. "
+            "Returns one dict with exactly 'total', 'available' and 'used' as "
+            "integer bytes plus 'usage_percent' as a float from 0 to 100. Use "
+            "'available' rather than 'total' when judging whether a model "
+            "will fit in RAM. Fixed-size response; no pagination."
         ),
         annotations=READ_ONLY,
     )
@@ -238,8 +306,16 @@ def register_system_tools(server: MCPServer) -> None:
         name="system_get_storage_info",
         title="Get storage capacity",
         description=(
-            "List every mounted drive with its total, used and free bytes. "
-            "Use it to check whether a model download will fit on disk."
+            "List free and used space per mounted drive. Primary tool for "
+            "deciding whether a model download or install will fit. No "
+            "prerequisites. Makes no subprocess call, returns immediately, "
+            "and mutates nothing. Returns a list of dicts, each with exactly "
+            "'drive' (for example 'C:\\' on Windows, '/' elsewhere), 'total', "
+            "'used' and 'free' as integer bytes. On Windows every existing "
+            "drive letter is enumerated in alphabetical order; a drive that "
+            "cannot be read is omitted rather than reported as an error. "
+            "Returns an empty list when nothing is readable. Response length "
+            "equals the number of drives; no pagination."
         ),
         annotations=READ_ONLY,
     )
@@ -251,9 +327,18 @@ def register_system_tools(server: MCPServer) -> None:
         name="system_get_gpu_info",
         title="Get NVIDIA GPU info",
         description=(
-            "List NVIDIA GPUs with device name, driver version, total, used "
-            "and free VRAM, and compute capability. Returns an empty list when "
-            "no NVIDIA GPU or nvidia-smi is available."
+            "List the NVIDIA GPUs and their VRAM. Primary tool for sizing a "
+            "model against available VRAM. No prerequisites. Runs nvidia-smi "
+            "once with a five-second timeout; read-only. Returns a list of "
+            "dicts, each with exactly 'name', 'driver', 'vram_total', "
+            "'vram_used', 'vram_free' and 'compute_capability'. The three "
+            "VRAM values are strings already suffixed with the unit, for "
+            "example '24564 MB' — parse the number out before comparing, and "
+            "do not treat them as bytes. Returns an empty list, not an error, "
+            "when there is no NVIDIA GPU, nvidia-smi is not installed, or the "
+            "query times out; an empty list therefore does not prove the "
+            "machine has no GPU. Reports AMD and Intel GPUs not at all. "
+            "Response length equals the GPU count; no pagination."
         ),
         annotations=READ_ONLY,
     )
@@ -265,8 +350,15 @@ def register_system_tools(server: MCPServer) -> None:
         name="system_get_cuda_version",
         title="Get CUDA version",
         description=(
-            "Return the CUDA version reported by the installed NVIDIA driver, "
-            "or null when it cannot be determined."
+            "Report the CUDA version the installed NVIDIA driver advertises, "
+            "for checking whether a CUDA-dependent runtime is supported. No "
+            "prerequisites. Runs nvidia-smi once with a five-second timeout — "
+            "a separate invocation from system_get_gpu_info, so call "
+            "system_scan instead when both are needed. Read-only. Returns the "
+            "version as a string such as '12.2', or null when no NVIDIA "
+            "driver is present or the version cannot be parsed; null is never "
+            "an error. This is the driver's CUDA capability, not an installed "
+            "CUDA toolkit."
         ),
         annotations=READ_ONLY,
     )
@@ -293,9 +385,17 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="ollama_get_status",
         title="Get Ollama status",
         description=(
-            "Report whether the Ollama binary is installed, whether its local "
-            "HTTP API is responding, and the installed version. Call this "
-            "before any other Ollama tool."
+            "Report whether Ollama is usable. Mandatory first step before any "
+            "other ollama_* tool: every model, benchmark and runtime tool "
+            "assumes the service is up, and none of them checks. Read-only. "
+            "Returns one dict with exactly three keys: 'installed' (the "
+            "ollama binary is on PATH), 'running' (its HTTP API on "
+            "127.0.0.1:11434 answered), and 'version' (string, or null when "
+            "the binary did not report one — null does not mean not "
+            "installed). When 'installed' is false, no other Ollama tool can "
+            "succeed: run ollama_install first. When 'installed' is true and "
+            "'running' is false, call ollama_start. Blocks up to about seven "
+            "seconds while probing the API and reading the version."
         ),
         annotations=READ_ONLY,
     )
@@ -307,19 +407,23 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="list_ollama_logs",
         title="List Ollama log files",
         description=(
-            "List the Ollama log files present on this machine with the size "
-            "and line count of each, without reading them: the live app.log "
-            "and server.log plus the rotated app-N.log and server-N.log "
-            "copies, from %LOCALAPPDATA%\\Ollama on Windows or ~/.ollama/logs "
-            "elsewhere. Returns 'files' as a list of {name, path, size_bytes, "
-            "line_count, modified} ordered most recently modified first, the "
-            "'directories' searched, and 'total_bytes'. Call this first and use "
-            "the sizes to choose — read_ollama_logs returns a whole file unless "
-            "a line range is requested, and server.log is often megabytes. The "
-            "line count is the bound to aim that range at: it is counted the "
-            "same way read_ollama_logs numbers its lines, so it can be passed "
-            "straight back as end_line. Fails when no Ollama log directory "
-            "exists."
+            "Index Ollama's own log files without reading their contents: the "
+            "live app.log and server.log plus rotated app-N.log and "
+            "server-N.log copies, from %LOCALAPPDATA%\\Ollama on Windows or "
+            "~/.ollama/logs and /var/log/ollama elsewhere. Mandatory first "
+            "step before read_ollama_logs, because which names exist depends "
+            "on how often Ollama has rotated its logs. Read-only. Returns one "
+            "dict with exactly 'files' (list of {name, path, size_bytes, "
+            "line_count, modified}, most recently modified first), "
+            "'directories' (those actually searched) and 'total_bytes'. Use "
+            "'size_bytes' and 'line_count' to plan pagination: "
+            "read_ollama_logs returns an entire file unless given a line "
+            "range, and server.log is often megabytes. 'line_count' is "
+            "counted exactly as read_ollama_logs numbers lines, so it can be "
+            "passed straight back as end_line. Every file is read once to "
+            "count lines, so this blocks in proportion to total log size. "
+            "Fails when no Ollama log directory exists; returns an empty "
+            "'files' list when the directories exist but hold no logs."
         ),
         annotations=READ_ONLY,
     )
@@ -331,24 +435,26 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="read_ollama_logs",
         title="Read an Ollama log file",
         description=(
-            "Read one Ollama log file chosen by the name that "
-            "list_ollama_logs reports — call that first, since the names "
-            "present depend on how often Ollama has rotated its logs. Only a "
-            "bare file name is accepted, not a path. By default the whole "
-            "file is returned with nothing truncated, and server.log in "
-            "particular can run to megabytes — so check the sizes and line "
-            "counts list_ollama_logs returns, prefer the smallest file that "
-            "covers the period you care about, and pass start_line and "
-            "end_line (1-based and inclusive; start_line defaults to the first "
-            "line and end_line to the last) to page through the large ones "
-            "instead. The response reports 'total_lines' for the whole file "
-            "and the 'start_line' and 'end_line' actually returned, both null "
-            "when the range matched nothing — which is what a range starting "
-            "past the end of the file looks like. server.log is the one that "
-            "says why the service or a model load failed and for GPU "
-            "detection, app.log for the desktop application. These are "
-            "Ollama's own logs; logs_read serves this project's execution log "
-            "instead."
+            "Read the contents of one Ollama log file. This is the diagnostic "
+            "of last resort for Ollama itself — why the service will not "
+            "start, why a model failed to load, why the GPU was not detected "
+            "— and it is server.log that records all three; app.log covers "
+            "the desktop application. These are Ollama's logs; logs_read "
+            "serves this project's own execution log instead. Requires a "
+            "prior list_ollama_logs call: file_name must be one bare name "
+            "from its 'files' list, matched exactly and case-sensitively, "
+            "never a path and never guessed. Read-only. PAGINATE: with no "
+            "range the whole file is returned untruncated and server.log can "
+            "be megabytes, which will overflow the context — pass start_line "
+            "and end_line (1-based, inclusive on both ends, so 1..500 is 500 "
+            "lines) sized against the 'line_count' list_ollama_logs reported, "
+            "and prefer the smallest file covering the period of interest. "
+            "The response carries 'total_lines' for the whole file plus the "
+            "'start_line' and 'end_line' actually returned; 'end_line' is the "
+            "real last line read, so an end_line past the end of the file "
+            "comes back as the true final line number. Both are null with "
+            "empty 'content' when the range began past the end of the file — "
+            "that is not an error. Fails when the name is not in the index."
         ),
         annotations=READ_ONLY,
     )
@@ -380,9 +486,17 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="ollama_start",
         title="Start Ollama service",
         description=(
-            "Start the Ollama background server and block until its API is "
-            "ready. Does nothing when it is already running. Fails when Ollama "
-            "is not installed or does not become ready within the timeout."
+            "Start the Ollama background server and block until its HTTP API "
+            "answers. Primary tool for bringing the service up; call it when "
+            "ollama_get_status reports installed=true and running=false. "
+            "Requires Ollama to be installed — it launches the binary, it "
+            "does not install it. Spawns a detached 'ollama serve' process "
+            "that outlives this call; does nothing when the API is already "
+            "answering, so it is safe to repeat. Blocks up to the timeout "
+            "argument, 15 seconds by default. Fails when Ollama is not "
+            "installed or the API does not answer within the timeout. Returns "
+            "the same 'installed'/'running'/'version' dict as "
+            "ollama_get_status, read after the attempt."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -408,9 +522,19 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="ollama_stop",
         title="Stop Ollama service",
         description=(
-            "Terminate the Ollama server process and block until its API stops "
-            "responding. Any model currently loaded in memory is unloaded. "
-            "Does nothing when Ollama is not installed or already stopped."
+            "Terminate the Ollama server process and block until its API "
+            "stops answering. Destructive and machine-wide: on Windows it "
+            "force-kills every ollama.exe rather than shutting down "
+            "gracefully, so any in-flight generation is lost and every model "
+            "resident in memory is unloaded. Do not call it while a benchmark "
+            "or a model run is outstanding. Does nothing when Ollama is not "
+            "installed or is already stopped. Blocks up to the timeout "
+            "argument, 10 seconds by default, and fails if the API is still "
+            "answering after it. Returns the same "
+            "'installed'/'running'/'version' dict as ollama_get_status, read "
+            "after the attempt. Models stay installed on disk; use "
+            "ollama_stop_model to free one model's VRAM without stopping the "
+            "service."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -436,9 +560,19 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         name="ollama_install",
         title="Install Ollama",
         description=(
-            "Run a local Ollama installer executable. Takes the path to an "
-            "installer already present on disk; it does not download anything. "
-            "The installer may prompt interactively."
+            "Install Ollama by executing an installer already present on "
+            "disk. installer_path must be a local filesystem path to that "
+            "executable, not a URL and not a download identifier — this tool "
+            "downloads nothing. Obtain the installer first with download_file "
+            "from an allowed domain, and pass the 'destination' it reported. "
+            "Modifies system state outside this project. No silent flag is "
+            "passed, so the installer may open a window and wait for input; "
+            "it blocks with no timeout, and an interactive prompt will hang "
+            "this call until the installer exits. There is no progress "
+            "variant, so nothing can be polled while it runs. Fails when the "
+            "path is not a file or the installer exits non-zero. Returns the "
+            "same 'installed'/'running'/'version' dict as ollama_get_status, "
+            "read afterwards; the install is not verified beyond that."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -476,8 +610,19 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_list_models",
         title="List installed models",
         description=(
-            "List models installed locally, as the raw table printed by "
-            "'ollama list' (name, ID, size, modified time)."
+            "List the models installed on this machine. Primary tool for "
+            "discovering what can be run, and the way to confirm a model name "
+            "before ollama_run_model, ollama_show_model_info, "
+            "ollama_configure_model, ollama_remove_model or any benchmark — "
+            "those all fail on an unknown name. Requires the Ollama service "
+            "to be running (ollama_get_status). Read-only. Returns the raw "
+            "text table printed by 'ollama list', with NAME, ID, SIZE and "
+            "MODIFIED columns, not a parsed structure; parse the NAME column "
+            "for exact tags. An empty string means either no models are "
+            "installed or the command failed — this tool does not distinguish "
+            "the two, so check ollama_get_status when the result is "
+            "unexpectedly empty. Response grows one line per installed model; "
+            "no pagination."
         ),
         annotations=READ_ONLY,
     )
@@ -489,8 +634,16 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_list_running_models",
         title="List running models",
         description=(
-            "List models currently loaded in memory, as the raw table printed "
-            "by 'ollama ps', including size and keep-alive expiry."
+            "List the models currently resident in memory, as opposed to "
+            "installed on disk. Use it to see what is occupying VRAM before "
+            "loading another model or starting a benchmark; use "
+            "ollama_list_models for what is installed. Requires the Ollama "
+            "service to be running. Read-only. Returns the raw text table "
+            "printed by 'ollama ps', including each model's size and "
+            "keep-alive expiry, not a parsed structure. An empty string means "
+            "no model is loaded or the command failed; the two are not "
+            "distinguished. Response grows one line per loaded model; no "
+            "pagination."
         ),
         annotations=READ_ONLY,
     )
@@ -502,9 +655,16 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_show_model_info",
         title="Show model details",
         description=(
-            "Show architecture, parameter count, quantization, context length "
-            "and the configured parameters for one installed model. Fails when "
-            "the model is not installed."
+            "Report one installed model's architecture, parameter count, "
+            "quantization, context length and baked-in parameters. Primary "
+            "tool for checking whether a model fits the hardware and what "
+            "context length it supports, before running or benchmarking it. "
+            "Requires the Ollama service to be running and the model to be "
+            "installed: model_name is a name or tag exactly as "
+            "ollama_list_models prints it in its NAME column, for example "
+            "'llama3' or 'llama3:8b'. Read-only. Returns the raw text 'ollama "
+            "show' prints, not a parsed structure. Fails when the model is "
+            "not installed. Fixed-size response; no pagination."
         ),
         annotations=READ_ONLY,
     )
@@ -524,9 +684,18 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_run_model",
         title="Run a prompt",
         description=(
-            "Send one prompt to a model and return its generated text. "
-            "Single-shot with no conversation history. For timing and "
-            "tokens-per-second measurements use ollama_run_test instead."
+            "Send one prompt to a model and return the text it generates. "
+            "Primary tool for getting output from a local model. Requires the "
+            "Ollama service to be running and model_name to be installed, as "
+            "printed by ollama_list_models. Single-shot: no conversation "
+            "history is kept, so each call is independent, and generation "
+            "parameters cannot be set here — use ollama_run_test to vary "
+            "them, or ollama_configure_model to bake them into a variant. "
+            "Returns the generated text only, with no timings or token "
+            "counts; use ollama_run_test when you need measurements. Blocks "
+            "for the whole generation with no timeout and no progress "
+            "reporting, which for a large model or a long prompt can be "
+            "minutes."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -552,9 +721,20 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_load_model",
         title="Preload a model",
         description=(
-            "Load a model into VRAM or system memory ahead of use and keep it "
-            "resident for the keep-alive duration. Returns null when the model "
-            "was already loaded. Requires the Ollama service to be running."
+            "Load a model into VRAM or system memory ahead of use, so the "
+            "first real prompt does not pay the load cost. Optional "
+            "optimisation: the benchmark tools preload on their own, and "
+            "ollama_run_model loads implicitly, so this is only worth calling "
+            "to warm a model before timing something yourself. This is a "
+            "memory-only operation — it installs nothing, downloads nothing, "
+            "and the model must already be installed; use download_file plus "
+            "ollama_add_model to put a new model on disk. Requires the Ollama "
+            "service to be running. The model stays resident for keep_alive "
+            "(an Ollama duration string such as '10m' or '1h'), occupying "
+            "VRAM until it expires or ollama_stop_model unloads it. Returns "
+            "Ollama's load response dict, or null when the model was already "
+            "resident — null means nothing needed doing, not a failure. "
+            "Blocks up to 300 seconds while the weights are read."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -583,8 +763,17 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_stop_model",
         title="Unload a model",
         description=(
-            "Unload a running model from memory, freeing its VRAM. The model "
-            "stays installed on disk."
+            "Unload one model from memory and free its VRAM, leaving it "
+            "installed on disk and leaving the Ollama service running. "
+            "Primary tool for reclaiming VRAM before loading a larger model; "
+            "ollama_stop kills the whole service instead, and "
+            "ollama_remove_model deletes the model permanently. Requires the "
+            "Ollama service to be running. model_name must name a model "
+            "currently loaded, as printed by ollama_list_running_models. "
+            "Nothing on disk is deleted and no data is lost, but any "
+            "generation in flight for that model is interrupted. Returns the "
+            "raw text 'ollama stop' prints, usually empty — an empty string "
+            "is success, not a failure."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -609,9 +798,20 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_add_model",
         title="Import a local model file",
         description=(
-            "Register a local model file (for example a .gguf) with Ollama "
-            "under a new name. The file must already exist on disk; nothing is "
-            "downloaded."
+            "Register a model weights file already on disk — typically a "
+            ".gguf — with Ollama under a new name, making it usable by every "
+            "other ollama_* tool. Primary tool for adopting a manually "
+            "obtained model. model_path is a local filesystem path to that "
+            "weights file, not a URL: download it first with download_file "
+            "and pass the 'destination' that reported. Requires the Ollama "
+            "service to be running. model_name is the new name to register; "
+            "Ollama overwrites an existing model of that name without "
+            "warning, so check ollama_list_models first. Ollama copies the "
+            "weights into its own store, so this consumes disk space roughly "
+            "equal to the file's size and the original file is left where it "
+            "is. Blocks for the whole import with no timeout and no progress "
+            "reporting. Returns the raw text 'ollama create' prints. Fails "
+            "when the path is not a file."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -637,11 +837,22 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_configure_model",
         title="Create a configured model variant",
         description=(
-            "Create a new model from an existing one with Modelfile PARAMETER "
-            "values baked in, for example temperature or num_ctx. The source "
-            "model is left unchanged. Use this for a persistent variant; for a "
-            "one-off parameter sweep use ollama_run_test, which applies "
-            "settings per request without creating a model."
+            "Create a new, separately named model from an existing one with "
+            "Modelfile PARAMETER values baked in, for example temperature or "
+            "num_ctx. Use this only when a persistent variant is wanted — for "
+            "trying parameters out, ollama_run_test and ollama_compare_tests "
+            "apply them per request and create nothing. Requires the Ollama "
+            "service to be running and source_model to be installed, as "
+            "printed by ollama_list_models. source_model is left completely "
+            "unchanged. target_model is the new name: an existing model of "
+            "that name is overwritten with no warning and no way back, so "
+            "verify it is free first. Each variant is a new entry in Ollama's "
+            "store, so repeated calls accumulate models — remove them with "
+            "ollama_remove_model. parameters is a flat dict of PARAMETER "
+            "key-values; entries whose value is null are dropped, and an "
+            "invalid key or value is only detected by Ollama. Blocks until "
+            "Ollama finishes creating the variant. Returns the raw text "
+            "'ollama create' prints."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -677,9 +888,17 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         name="ollama_remove_model",
         title="Delete a model",
         description=(
-            "Permanently delete a model from local Ollama storage. This frees "
-            "disk space and cannot be undone; the model must be downloaded or "
-            "re-imported to get it back."
+            "Permanently delete a model from Ollama's local storage, freeing "
+            "its disk space. IRREVERSIBLE: there is no recycle bin and no "
+            "undo — recovering the model means downloading or re-importing "
+            "it. Confirm the exact name with ollama_list_models before "
+            "calling, since a tag such as 'llama3' and 'llama3:8b' are "
+            "different entries, and deleting a source model breaks nothing "
+            "about a variant made from it but cannot be reversed. Requires "
+            "the Ollama service to be running. To free VRAM without deleting "
+            "anything use ollama_stop_model instead. Returns the raw text "
+            "'ollama rm' prints, normally \"deleted '<model>'\". Fails when "
+            "the model is not installed."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -722,14 +941,31 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
         name="ollama_run_test",
         title="Benchmark one configuration",
         description=(
-            "Run a set of prompts against one model with temporary generation "
-            "parameters and measure performance: wall-clock duration, prompt "
-            "and output token counts, and tokens per second per prompt, plus "
-            "averages across the run. The parameters apply per request, so no "
-            "model is created or modified. The model is preloaded before each "
-            "prompt and that load time is excluded from the measurements. A "
-            "prompt that fails is recorded with its error instead of aborting "
-            "the run. Long-running: each prompt is a full generation."
+            "Measure one model's generation performance across a list of "
+            "prompts under a single set of parameters, and return the "
+            "measurements in this one call. Primary tool when you want "
+            "benchmark numbers immediately and no progress bar; use "
+            "ollama_run_test_with_progress instead when a human is watching, "
+            "since that runs in the background and reports progress. Requires "
+            "the Ollama service to be running and model_name to be installed. "
+            "config holds per-request generation options, so no model is "
+            "created or modified — reach for ollama_configure_model only when "
+            "a persistent variant is wanted. Returns one dict with exactly "
+            "'name', 'model', 'configuration', 'results' (one entry per "
+            "prompt, in order) and 'summary'. A successful prompt entry "
+            "carries 'duration_seconds', 'prompt_tokens', 'output_tokens', "
+            "'prompt_tokens_per_second' and 'output_tokens_per_second'; a "
+            "rate of null means Ollama did not report it, not zero "
+            "throughput. 'summary' holds 'average_duration_seconds', the two "
+            "average rates and 'total_output_tokens', computed over "
+            "successful prompts only. The model is preloaded before each "
+            "prompt and that load time is excluded from every figure. A "
+            "prompt that fails is recorded with 'success': false and an "
+            "'error' instead of aborting the run. Leave include_output false "
+            "unless the generated text itself is needed: true adds every full "
+            "completion to the response and can overflow the context. Blocks "
+            "for the sum of all generations with no timeout and no progress "
+            "reporting."
         ),
         annotations=benchmark,
     )
@@ -766,12 +1002,26 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
         name="ollama_compare_tests",
         title="Compare configurations",
         description=(
-            "Run the same prompts against one model under several parameter "
-            "configurations and return the benchmark results side by side, so "
-            "settings can be compared on speed and token throughput. Each "
-            "configuration is a dict with a 'name' and an 'options' dict of "
-            "generation parameters. Long-running: total time is the prompt "
-            "count multiplied by the configuration count."
+            "Benchmark one model repeatedly, once per parameter "
+            "configuration, over the same prompts, and return every "
+            "configuration's measurements side by side in this one call. "
+            "Primary tool for choosing between parameter sets when you want "
+            "the numbers immediately; use ollama_compare_tests_with_progress "
+            "when a human is watching. Requires the Ollama service to be "
+            "running and model_name to be installed. Each entry in "
+            "configurations is a dict with 'name' (a label; defaults to "
+            "'configuration_N') and 'options' (the generation parameters, "
+            "defaulting to none). Parameters are applied per request; no "
+            "model is created or modified. Returns one dict with exactly "
+            "'model' and 'tests', where 'tests' holds one full "
+            "ollama_run_test result per configuration in the order given — "
+            "there is no combined summary and no winner, so compare the "
+            "per-configuration 'summary' values yourself. Total cost is the "
+            "prompt count multiplied by the configuration count, every one a "
+            "full generation, and it blocks for all of them with no timeout "
+            "and no progress reporting. Leave include_output false unless the "
+            "generated text is needed: true multiplies the response size by "
+            "the configuration count and can overflow the context."
         ),
         annotations=benchmark,
     )
@@ -817,9 +1067,20 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_get_status",
         title="List installed Python versions",
         description=(
-            "List Python installations detected on the machine, each with its "
-            "version and interpreter path. On Windows this reads the registry; "
-            "the interpreter running this server is always included."
+            "List the Python interpreters installed on this machine. Primary "
+            "tool for discovering which versions are available before "
+            "creating an environment or deciding whether "
+            "python_install_python is needed. No prerequisites. Read-only; "
+            "reads the Windows registry under HKLM and HKCU, so it makes no "
+            "subprocess call and returns immediately. Returns a list of "
+            "dicts, each with exactly 'version' and 'path' (the absolute "
+            "interpreter path). The interpreter running this server is always "
+            "included, so the list is never empty. Version granularity is "
+            "inconsistent: registry entries report major.minor such as "
+            "'3.12', while the running interpreter reports full "
+            "major.minor.micro. A version present in both registry hives "
+            "appears twice. Response length equals the interpreter count; no "
+            "pagination."
         ),
         annotations=READ_ONLY,
     )
@@ -831,10 +1092,17 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_get_python_path",
         title="Resolve interpreter path",
         description=(
-            "Return the absolute path to a Python interpreter. With no "
-            "environment given, returns the interpreter running this server; "
-            "otherwise returns the interpreter inside that virtual "
-            "environment and fails if it is missing."
+            "Resolve the absolute path of the interpreter a given environment "
+            "would use. Secondary tool: every python_* tool resolves this "
+            "internally, so call it only to report the path or to verify an "
+            "environment before using it. env_path is a virtual environment "
+            "directory as passed to or returned by python_create_environment; "
+            "omit it to get the interpreter running this server. Read-only; "
+            "no subprocess, returns immediately. Returns the path as a "
+            "string. Fails when env_path is given but holds no interpreter — "
+            "which makes it a cheap existence check for an environment. It "
+            "does not otherwise verify that the directory is a valid virtual "
+            "environment."
         ),
         annotations=READ_ONLY,
     )
@@ -854,9 +1122,18 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_create_environment",
         title="Create a virtual environment",
         description=(
-            "Create a new venv at the given path using the interpreter running "
-            "this server. Fails if the path already exists, so it will never "
-            "overwrite an existing environment."
+            "Create a new virtual environment on disk. Primary tool for "
+            "isolating packages before python_install_packages or "
+            "python_run_script; pass the same path to those tools afterwards "
+            "as their env_path. No prerequisites. env_path is the directory "
+            "to create — it must not already exist, and the call fails rather "
+            "than overwriting anything, so an existing environment is never "
+            "disturbed. The environment always uses the interpreter running "
+            "this server; there is no way to select a version here, so check "
+            "python_get_status first if a specific version matters. Blocks "
+            "while venv runs, with no timeout and no progress reporting. "
+            "Returns the created environment's absolute path as a string, "
+            "which is the value to reuse as env_path."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -881,10 +1158,18 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_remove_environment",
         title="Delete a virtual environment",
         description=(
-            "Recursively delete a virtual environment directory and everything "
-            "inside it, including installed packages. Irreversible: the path is "
-            "removed without a backup, so confirm it is the intended "
-            "environment first."
+            "Recursively delete a directory and everything inside it, "
+            "including every package installed there. IRREVERSIBLE: the tree "
+            "is unlinked with no backup and no recycle bin. It does NOT "
+            "verify that the target is a virtual environment — any existing "
+            "directory path given here is destroyed, so confirm env_path is "
+            "the environment you mean, ideally by resolving it first with "
+            "python_get_python_path. env_path is the environment directory as "
+            "returned by python_create_environment. Fails when the path does "
+            "not exist. A failure part-way through, for example a locked file "
+            "on Windows, can leave the tree partly deleted. Blocks for the "
+            "duration of the walk. Returns a confirmation string naming the "
+            "removed path."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -910,9 +1195,17 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_list_packages",
         title="List installed packages",
         description=(
-            "List installed packages and versions via 'pip list'. Targets the "
-            "given virtual environment, or the interpreter running this server "
-            "when none is given."
+            "List the packages installed for one interpreter, with their "
+            "versions. Primary tool for checking whether a dependency is "
+            "present and at what version, and the way to confirm a package "
+            "name before python_uninstall_packages. env_path is a virtual "
+            "environment directory as returned by python_create_environment; "
+            "omit it to inspect the interpreter running this server. "
+            "Read-only. Returns the raw text table 'pip list' prints, not a "
+            "parsed structure — parse the two columns yourself. Blocks while "
+            "pip runs, with no timeout. Response grows one line per installed "
+            "package and there is no pagination or filter, so an environment "
+            "with hundreds of packages produces a long result."
         ),
         annotations=READ_ONLY,
     )
@@ -932,10 +1225,21 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_install_packages",
         title="Install packages",
         description=(
-            "Install one or more packages with pip into the given virtual "
-            "environment, or into the interpreter running this server when "
-            "none is given. Accepts version specifiers such as 'numpy==1.26.4'. "
-            "Downloads from the configured package index."
+            "Install packages with pip into one interpreter. Primary tool for "
+            "adding dependencies. env_path is a virtual environment directory "
+            "as returned by python_create_environment; omitting it installs "
+            "into the interpreter running this server, which mutates the "
+            "environment this server itself depends on — prefer an explicit "
+            "environment. packages is a list of requirement strings, each "
+            "optionally pinned, for example 'numpy==1.26.4'; pin versions "
+            "when reproducibility matters. Reaches the network and downloads "
+            "from the configured package index, and installing a package can "
+            "upgrade or downgrade its dependencies in place. Blocks until pip "
+            "exits, with no timeout and no progress reporting, which for "
+            "large wheels can be minutes. Returns pip's stdout as raw text; "
+            "pip's warnings on stderr are discarded on success. Fails on a "
+            "non-zero pip exit with pip's stderr as the error. Confirm the "
+            "outcome with python_list_packages."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -967,10 +1271,19 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_uninstall_packages",
         title="Uninstall packages",
         description=(
-            "Uninstall one or more packages with pip, without prompting for "
-            "confirmation. Targets the given virtual environment, or the "
-            "interpreter running this server when none is given — note that "
-            "removing a package from the server's own interpreter can break it."
+            "Remove packages with pip from one interpreter. DESTRUCTIVE and "
+            "unconfirmed: pip runs with -y, so there is no prompt, and a "
+            "package's dependents are left broken rather than removed. "
+            "Confirm the exact names with python_list_packages first. "
+            "env_path is a virtual environment directory as returned by "
+            "python_create_environment; omitting it targets the interpreter "
+            "running this server, and removing a package there can break this "
+            "server itself — always pass an environment unless the intent is "
+            "explicitly to change the server's own interpreter. Blocks until "
+            "pip exits, with no timeout. Returns pip's stdout as raw text. "
+            "Naming a package that is not installed is not an error, so "
+            "success does not prove anything was removed — verify with "
+            "python_list_packages."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1002,9 +1315,17 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_create_script",
         title="Create a script file",
         description=(
-            "Write a new Python script to disk, creating parent directories as "
-            "needed. Fails if the file already exists, so it will never "
-            "overwrite; use python_edit_script to replace existing content."
+            "Write a new Python script to disk. Primary tool for adding a "
+            "script; use python_edit_script to change one that already "
+            "exists. path must end in .py and is the file to create; missing "
+            "parent directories are created for it. Fails if the file already "
+            "exists, so no existing content can ever be lost here — on that "
+            "failure, read the file with python_read_script and decide "
+            "whether to overwrite it with python_edit_script. content is the "
+            "complete source text, written as UTF-8. Writes anywhere on the "
+            "filesystem the server can reach; there is no sandbox. Returns "
+            "the created file's absolute path as a string, which is the value "
+            "to pass to python_run_script."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1030,11 +1351,16 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_read_script",
         title="Read a script file",
         description=(
-            "Return the source text of an existing Python script. Reads only "
-            "files with a .py extension and fails when the path does not "
-            "exist, so it is the way to inspect a script before rewriting it "
-            "with python_edit_script — that tool is a full overwrite, and the "
-            "previous content is not recoverable afterwards."
+            "Return a Python script's full source text. MANDATORY before "
+            "python_edit_script: that tool replaces the whole file and the "
+            "previous content cannot be recovered, so read it first whenever "
+            "any of it must be preserved. Also the way to inspect a script "
+            "before python_run_script executes it. path must end in .py and "
+            "name an existing file. Read-only. Returns the source exactly as "
+            "stored, unmodified and untruncated — the whole file arrives in "
+            "the response, with no line range and no pagination, so a very "
+            "large script consumes context proportionally. Fails when the "
+            "path does not exist or is not a .py file."
         ),
         annotations=READ_ONLY,
     )
@@ -1054,10 +1380,14 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_edit_script",
         title="Overwrite a script file",
         description=(
-            "Replace the entire contents of an existing Python script. This is "
-            "a full overwrite, not a patch: the previous content is lost, so "
-            "read it with python_read_script first when any of it needs to be "
-            "kept. Fails if the file does not exist."
+            "Replace a Python script's entire contents. FULL OVERWRITE, NOT A "
+            "PATCH: content becomes the whole file, everything previously in "
+            "it is discarded, and there is no backup or undo. Requires a "
+            "prior python_read_script call on the same path whenever any "
+            "existing content must survive — send the complete intended file, "
+            "not a fragment. path must end in .py and name an existing file; "
+            "it will not create one, so use python_create_script for a new "
+            "script. Returns the file's absolute path as a string."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1083,8 +1413,13 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_delete_script",
         title="Delete a script file",
         description=(
-            "Delete a Python script file from disk. Irreversible: the file is "
-            "unlinked rather than moved to a recycle bin."
+            "Delete one Python script file from disk. IRREVERSIBLE: the file "
+            "is unlinked immediately, not moved to a recycle bin, and there "
+            "is no backup. Read it with python_read_script first if its "
+            "contents may still be wanted. path must end in .py and name an "
+            "existing file; directories are refused, and only that single "
+            "file is removed. Returns the deleted file's absolute path as a "
+            "string. Fails when the path does not exist."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1109,11 +1444,24 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_run_script",
         title="Run a script",
         description=(
-            "Execute a Python script and return its standard output, using the "
-            "given virtual environment or the interpreter running this server. "
-            "Blocks until the script exits and fails with the script's stderr "
-            "on a non-zero exit code. The script runs with this server's "
-            "privileges and can perform any action Python allows."
+            "Execute a Python script file and return what it printed. "
+            "DESTRUCTIVE by delegation: the script runs with this server's "
+            "full privileges and can read, write or delete anything the "
+            "server can, with no sandbox — read it with python_read_script "
+            "before running anything you did not just write. path must end in "
+            ".py and name an existing file, for example the path "
+            "python_create_script returned. env_path is a virtual environment "
+            "directory as returned by python_create_environment; omit it to "
+            "use the interpreter running this server. The script starts with "
+            "the server's working directory, not its own, and with stdin "
+            "closed, so any call to input() raises EOFError and fails the "
+            "run. Blocks until the process exits, with no timeout, no "
+            "progress reporting and no way to kill it — an infinite loop "
+            "hangs this call indefinitely. Returns stdout as raw text, "
+            "stripped; stderr is discarded on success. On a non-zero exit it "
+            "fails with the script's stderr as the error and stdout is lost, "
+            "so have the script print diagnostics to stdout if you need them "
+            "either way."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1142,11 +1490,22 @@ def register_python_tools(server: MCPServer) -> None:
         name="python_install_python",
         title="Install Python from an installer",
         description=(
-            "Run a local Windows Python installer in quiet mode with PATH "
-            "prepending enabled. The installer must already be on disk; "
-            "nothing is downloaded. Modifies system state outside this project "
-            "and may require elevation when installing for all users. Returns "
-            "the detected Python installations afterwards."
+            "Install a Python interpreter by executing a Windows installer "
+            "already present on disk. installer_path is a local filesystem "
+            "path to that executable, not a URL — this tool downloads "
+            "nothing; fetch the installer first with download_file from "
+            "python.org and pass the 'destination' it reported. Modifies "
+            "system state outside this project: it runs quietly with PATH "
+            "prepending enabled, so the machine's default 'python' can "
+            "change. all_users=true installs machine-wide and needs "
+            "administrator rights, which this tool does not acquire — without "
+            "them the installer exits non-zero and the call fails. Blocks "
+            "until the installer exits, with no timeout and no progress "
+            "variant to poll. Returns the same list of 'version'/'path' dicts "
+            "as python_get_status, re-detected afterwards; compare it against "
+            "a python_get_status call made before the install to confirm a "
+            "new version actually appeared, since the installer's own output "
+            "is not returned."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1260,6 +1619,30 @@ def _discard_session(session_id: str) -> dict | None:
     return status
 
 
+def _download_destination(
+    manager: DownloadManager,
+    directory: str,
+) -> str | None:
+    """Report the path the single queued file is being written to.
+
+    MSHCore may rename a file to avoid overwriting one already on disk, so the
+    name is read back from the queue rather than assumed from the URL.
+
+    Args:
+        manager: Manager holding the one-file queue.
+        directory: Directory the session writes into.
+
+    Returns:
+        str | None: Full path to the file, or None when the queue is empty.
+    """
+    downloads = manager.get_status()["downloads"]
+
+    if not downloads:
+        return None
+
+    return str(Path(directory) / downloads[0]["filename"])
+
+
 def register_download_tools(server: MCPServer) -> None:
     """Register download queue tools.
 
@@ -1271,22 +1654,178 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_list_allowed_domains",
         title="List allowed download domains",
         description=(
-            "List the domains downloads may come from. MSHCore rejects any other "
-            "host, so check this before queueing a URL."
+            "List every host a download may come from. Call it before "
+            "queueing a URL from an unfamiliar host: MSHCore validates the "
+            "host itself and rejects anything else before queueing, so this "
+            "only saves a failed call. No prerequisites. Read-only. Returns a "
+            "flat list of strings — exact hostnames first, then wildcard "
+            "entries written literally as '*.example.com', meaning that "
+            "domain and any subdomain of it. A host not matching an entry on "
+            "this list is rejected by download_file, download_add and "
+            "download_add_many. Only http and https URLs are accepted at all. "
+            "Short fixed-size response; no pagination."
         ),
         annotations=READ_ONLY,
     )
     @surface_core_errors
     def download_list_allowed_domains() -> list[str]:
-        return sorted(ALLOWED_DOMAINS)
+        return allowed_sources()
+
+    @server.tool(
+        name="download_file",
+        title="Download one file",
+        description=(
+            "Download a single URL. PRIMARY download tool and the only one "
+            "needed for one file: it creates the session, queues the URL and "
+            "starts the transfer with a live progress bar in one call, so "
+            "never combine it with download_create_session, download_add or "
+            "download_start. url must be http or https on a host from "
+            "download_list_allowed_domains. destination_directory is created "
+            "if missing. Returns immediately by default with a ticket "
+            "carrying 'download_id' (a progress_id — pass it only to "
+            "progress_get_status, progress_pause or progress_cancel), "
+            "'session_id' (pass it only to the download_* queue tools if the "
+            "transfer needs pausing or cancelling through them), "
+            "'destination' and 'status'. Those two identifiers are not "
+            "interchangeable. Pass wait=true to block until the transfer "
+            "reaches a terminal state and receive the outcome plus per-file "
+            "details directly — suitable only for a small file, since a "
+            "transfer still running after timeout_seconds comes back with "
+            "'timed_out': true and must be polled anyway. Never overwrites: "
+            "when the destination name is already taken the file is saved "
+            "under a numbered variant, and 'destination' reports the name "
+            "actually used. A rejected domain or an unusable directory fails "
+            "before anything is queued or written."
+        ),
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=True,
+        ),
+    )
+    @surface_core_errors
+    def download_file(
+        url: str,
+        destination_directory: str = "data/downloads",
+        filename: str | None = None,
+        max_retries: int = 3,
+        wait: bool = False,
+        timeout_seconds: float = 120.0,
+    ) -> dict:
+        """Download one URL, creating and starting its session in one call.
+
+        Args:
+            url: HTTP or HTTPS URL on an allowed domain.
+            destination_directory: Directory the file is written into, created
+                if needed.
+            filename: Optional destination filename; taken from the URL when
+                omitted, and numbered if that name is already taken.
+            max_retries: Retry attempts before the transfer is marked failed.
+            wait: Block until the transfer reaches a terminal state instead of
+                returning a ticket.
+            timeout_seconds: How long to block when ``wait`` is set.
+
+        Returns:
+            dict: A ticket carrying ``download_id``, ``session_id``,
+            ``destination`` and ``status`` when not waiting; the finished
+            outcome, including the per-file status, when waiting.
+        """
+        # The session is this tool's own bookkeeping, not something the caller
+        # named, so the id is generated. It is still returned, because the
+        # download_* tools act on a session and a caller may want to pause or
+        # cancel this one.
+        session_id = f"auto-{uuid4().hex[:8]}"
+
+        manager = DownloadManager(
+            download_directory=destination_directory,
+            max_retries=max_retries,
+        )
+
+        with _sessions_lock:
+            _sessions[session_id] = manager
+
+        try:
+            manager.add(url=url, filename=filename)
+            job = start_download(manager, session_id)
+        except Exception:
+            # A rejected domain or an unusable directory must not leave a
+            # session behind holding a queue nothing will ever run.
+            _discard_session(session_id)
+            raise
+
+        destination = _download_destination(manager, destination_directory)
+
+        if not wait:
+            return {
+                "download_id": job.id,
+                "session_id": session_id,
+                "destination": destination,
+                "status": "running",
+                "next_step": (
+                    f"Poll progress_get_status(progress_id='{job.id}') for "
+                    f"progress, or download_get_status(session_id="
+                    f"'{session_id}') for the queue's own view."
+                ),
+            }
+
+        finished = job.wait(timeout_seconds)
+        snapshot = job.snapshot()
+
+        if not finished:
+            # Still transferring. The session stays registered so the caller can
+            # keep polling it rather than starting the download again.
+            return {
+                "download_id": job.id,
+                "session_id": session_id,
+                "destination": destination,
+                "status": "running",
+                "timed_out": True,
+                "message": (
+                    f"Still downloading after {timeout_seconds} seconds. Poll "
+                    f"progress_get_status(progress_id='{job.id}')."
+                ),
+            }
+
+        # Read the queue before discarding the session: the discard purges it.
+        final = manager.get_status()
+        # The worker resolves the name again just before transferring, so this is
+        # where a rename shows up. A cancellation may already have purged the
+        # queue, in which case the name from before the wait still stands.
+        destination = (
+            _download_destination(manager, destination_directory) or destination
+        )
+        _discard_session(session_id)
+
+        return {
+            "download_id": job.id,
+            "session_id": session_id,
+            "destination": destination,
+            "status": snapshot["status"],
+            "message": snapshot.get("message"),
+            "error": snapshot.get("error"),
+            "elapsed_seconds": snapshot.get("elapsed_seconds"),
+            "files": final["downloads"],
+        }
 
     @server.tool(
         name="download_create_session",
         title="Create a download session",
         description=(
-            "Create a named download queue writing into the given directory, "
-            "creating it if needed. The session id is used by every other "
-            "download tool. Fails if the id is already in use."
+            "STEP 1 of 3 for downloading several files as one unit of work: "
+            "create an empty named queue. Nothing is downloaded here — follow "
+            "with download_add or download_add_many for every file, then "
+            "download_start_with_progress (or download_start) to begin "
+            "transferring. For a single file use download_file instead, which "
+            "does all three steps itself. session_id is a name you choose; it "
+            "is the handle every other download_* tool takes, and it is NOT a "
+            "progress_id, so never pass it to progress_get_status. Fails if "
+            "that name is already in use — list the open ones with "
+            "download_list_sessions. download_directory is created if missing "
+            "and is where completed files land; relative paths resolve "
+            "against this server's working directory. max_retries is total "
+            "attempts per file, not extra ones. Returns the new session's "
+            "initial status, with an empty 'downloads' list."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1329,8 +1868,19 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_list_sessions",
         title="List download sessions",
         description=(
-            "List open download sessions with each one's current status, "
-            "including whether it is running and how many files are queued."
+            "List every open download session with its full status. Use it to "
+            "recover a forgotten session_id, to check which name is free "
+            "before download_create_session, or to see what is still "
+            "transferring. No prerequisites. Read-only. Returns a dict keyed "
+            "by session_id, each value being the same status dict "
+            "download_get_status returns — including the per-file 'downloads' "
+            "list, so the response grows with the total number of queued "
+            "files across all sessions and there is no pagination; prefer "
+            "download_get_status for one known session. Cancelled and closed "
+            "sessions are absent: their identifiers are free for reuse. "
+            "Sessions live in memory only and none survives a restart of this "
+            "server, whereas a progress_id remains valid for "
+            "progress_get_status across restarts."
         ),
         annotations=READ_ONLY,
     )
@@ -1348,10 +1898,22 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_add",
         title="Queue a file",
         description=(
-            "Append a URL to a session's queue. The filename is taken from the "
-            "URL unless one is given. The host must be in "
-            "download_list_allowed_domains. Queue every file before calling "
-            "download_start."
+            "STEP 2 of 3: append one URL to an existing session's queue, with "
+            "control over its filename. ENQUEUES ONLY — nothing is "
+            "transferred and no network request is made until "
+            "download_start_with_progress or download_start is called on the "
+            "same session. Requires download_create_session first: session_id "
+            "is that session's name, never a progress_id. url must be http or "
+            "https on a host from download_list_allowed_domains; a rejected "
+            "host fails immediately and queues nothing. filename overrides "
+            "the name taken from the URL; any directory part is stripped, so "
+            "files always land directly in the session's download directory. "
+            "An existing file is never overwritten — a taken name becomes a "
+            "numbered variant, and the name actually reserved appears as "
+            "'filename' in the returned status. Queue every file before "
+            "starting; adding to a session that is already running is not how "
+            "a queue is extended safely. Returns the session's status after "
+            "queueing."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1384,9 +1946,20 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_add_many",
         title="Queue several files",
         description=(
-            "Append multiple URLs to a session's queue in order, each named "
-            "after its URL. Rejects the batch as soon as one host is not "
-            "allowed, so URLs queued before that point remain queued."
+            "STEP 2 of 3, batched: append several URLs to an existing "
+            "session's queue in order, each named after its own URL. ENQUEUES "
+            "ONLY — nothing is transferred until download_start_with_progress "
+            "or download_start is called. Requires download_create_session "
+            "first: session_id is that session's name, never a progress_id. "
+            "Use download_add instead when any file needs an explicit "
+            "filename. NOT ATOMIC: validation happens per URL as the list is "
+            "walked, so the first host outside download_list_allowed_domains "
+            "fails the call with the earlier URLs left queued and the rest "
+            "not queued at all — on failure, read the returned error and "
+            "inspect download_get_status before retrying, or the survivors "
+            "will be downloaded alongside a second attempt. Duplicate URLs "
+            "are not detected and would be fetched twice under different "
+            "names. Returns the session's status after queueing."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1414,10 +1987,21 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_start",
         title="Start downloading",
         description=(
-            "Start processing a session's queue on a background thread and "
-            "return immediately. Files download one at a time with automatic "
-            "retry and resume. Poll download_get_status for progress. Fails if "
-            "the queue is empty; does nothing if already running."
+            "STEP 3 of 3: begin transferring a session's queue. Secondary "
+            "option — prefer download_start_with_progress, which does the "
+            "same thing and renders a live progress bar; use this one only "
+            "when no progress bar is wanted. Requires download_create_session "
+            "and at least one download_add or download_add_many first, and "
+            "fails when the queue is empty; session_id is that session's "
+            "name, never a progress_id. Returns immediately: files transfer "
+            "one at a time on a background thread with automatic retry and "
+            "resume, so the returned status shows the queue only as it was at "
+            "the moment of starting. This tool mints no progress_id — track "
+            "the queue with download_get_status(session_id) instead, and use "
+            "download_start_with_progress if you want an id for "
+            "progress_get_status. Does nothing when the session is already "
+            "running. Restarting a session retries files that failed and "
+            "leaves completed, skipped and cancelled ones alone."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1444,10 +2028,26 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_get_status",
         title="Get download progress",
         description=(
-            "Report a session's running, paused and cancelled state, which file "
-            "is active, and per-file status with bytes downloaded, total size, "
-            "current transfer speed in bytes per second, and any error. Poll "
-            "this to follow progress."
+            "Report one download session's state and every queued file's "
+            "progress. This is the queue's own view, keyed by session_id — "
+            "the counterpart for a progress_id is progress_get_status, and "
+            "the two identifiers are not interchangeable. Requires the "
+            "session to still be open. Read-only, fast, and safe to poll "
+            "repeatedly. Returns one dict with 'running', 'paused', "
+            "'cancelled', 'closed', 'files_deleted', 'cancel_reason', "
+            "'current_index' (0-based, -1 before the first file starts), "
+            "'total_files' and 'downloads'. Each 'downloads' entry has 'url', "
+            "'filename' (the name actually being written, which may differ "
+            "from the one requested), 'requested_filename' (set only when "
+            "renamed), 'status', 'downloaded' and 'total' in bytes with "
+            "'total' null when the server sent no length, 'speed' in bytes "
+            "per second as a running average, and 'error'. A file's 'status' "
+            "is one of 'waiting', 'connecting', 'downloading', 'paused', "
+            "'retrying', 'completed', 'skipped', 'failed' or 'cancelled'. The "
+            "response grows with the queue length and has no pagination, so "
+            "keep queues to a reasonable size. 'files_deleted' true means a "
+            "cancellation intends to delete this session's files, not that "
+            "deletion has finished."
         ),
         annotations=READ_ONLY,
     )
@@ -1467,9 +2067,18 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_pause",
         title="Pause downloading",
         description=(
-            "Pause the active download, keeping the partial file so it can "
-            "resume from where it stopped. Does nothing when the session is "
-            "not running or is already paused."
+            "Suspend a session's active transfer without cancelling it. "
+            "Non-destructive: the queue, the files already completed and the "
+            "active file's partial data are all kept, so download_resume "
+            "continues from where it stopped rather than restarting. Requires "
+            "a session that download_start or download_start_with_progress "
+            "has started; session_id is the queue's name, never a progress_id "
+            "— the progress_id equivalent is progress_pause. Returns "
+            "immediately; the transfer stops at its next chunk boundary, so "
+            "the returned status may still show 'downloading' for a moment. "
+            "Does nothing when the session is not running or is already "
+            "paused. To stop a session and discard what it produced, use "
+            "download_cancel instead."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1496,9 +2105,17 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_resume",
         title="Resume downloading",
         description=(
-            "Resume a paused session, continuing the active file from its "
-            "partial data via an HTTP range request. Does nothing when the "
-            "session is not paused."
+            "Continue a session paused by download_pause. Requires that "
+            "session to be paused; session_id is the queue's name, never a "
+            "progress_id. The active file continues from its partial data via "
+            "an HTTP range request rather than starting over, so no bytes are "
+            "refetched and nothing already on disk is discarded. Returns "
+            "immediately with the session's status; the transfer picks up on "
+            "its background thread. Does nothing when the session is not "
+            "paused, so it cannot be used to start a queue that was never "
+            "started — use download_start_with_progress or download_start for "
+            "that. It cannot revive a cancelled session either: that requires "
+            "creating the session again."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1525,8 +2142,18 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_skip",
         title="Skip the current file",
         description=(
-            "Abandon the file being downloaded, mark it skipped, and move on to "
-            "the next one in the queue. Its partial data is left on disk."
+            "Abandon the file currently transferring and move on to the next "
+            "in the queue. Use it for one file that is stalled or unwanted; "
+            "the rest of the queue continues, unlike download_cancel which "
+            "abandons everything. Requires a running session; session_id is "
+            "the queue's name, never a progress_id. The skipped file is "
+            "marked 'skipped' and is not retried by a later download_start, "
+            "and its partial data is left on disk rather than deleted — clean "
+            "it up yourself if it matters, or use download_cancel to have the "
+            "session's files removed. Returns immediately with the session's "
+            "status; the skip takes effect at the next chunk boundary. "
+            "Calling it between files, when nothing is transferring, applies "
+            "the skip to the next file instead."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1553,15 +2180,23 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_cancel",
         title="Cancel all downloads",
         description=(
-            "Stop the active download, abandon the rest of the queue, and delete "
-            "the files this session produced — both partial data and files that "
-            "had already completed, since the queue is one unit of work that did "
-            "not finish. Files that existed before the session started are kept. "
-            "The stop is recorded in the execution log, and the session is then "
-            "removed: its id becomes free, and downloading the same files again "
-            "means creating the session again. Cancelling a queue that already "
-            "finished deletes nothing. Pass keep_files to abandon the queue "
-            "without deleting anything."
+            "Stop a session's active transfer, abandon the rest of its queue, "
+            "and delete the files it produced. IRREVERSIBLE AND DELETES "
+            "COMPLETED FILES: both partial data and files this session had "
+            "already finished are removed, because the queue is one unit of "
+            "work that did not complete. Files that existed before the "
+            "session started are never touched, and a queue that had already "
+            "finished everything loses nothing. Pass keep_files=true to "
+            "abandon the queue while leaving every downloaded file in place. "
+            "Requires an open session; session_id is the queue's name, never "
+            "a progress_id — the progress_id equivalent is progress_cancel. "
+            "To suspend instead of destroying, use download_pause. The "
+            "cancellation is recorded in the execution log, where logs_read "
+            "will show it. The session is then removed: its identifier "
+            "becomes free, it refuses all further use, and downloading the "
+            "same files again means calling download_create_session and "
+            "download_add from scratch. Blocks up to 60 seconds so the "
+            "returned status reflects the completed cleanup."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1611,11 +2246,19 @@ def register_download_tools(server: MCPServer) -> None:
         name="download_close_session",
         title="Close a download session",
         description=(
-            "Drop a session from the registry, stopping it first if it is still "
-            "running. Downloaded files are left on disk; only the in-memory queue "
-            "and its progress history are discarded, and the session id becomes "
-            "free again. Use download_cancel to stop a session and delete what it "
-            "produced."
+            "Finish with a download session and drop it, keeping every file "
+            "it downloaded. This is the tidy end to a completed session and "
+            "the safe way to stop one without losing data; download_cancel "
+            "deletes the session's files instead. Requires an open session; "
+            "session_id is the queue's name, never a progress_id. A "
+            "still-running transfer is stopped first, and both completed and "
+            "partial files are left on disk. What is discarded is only "
+            "in-memory state: the queue and its progress history, which are "
+            "unrecoverable, so read download_get_status first if that record "
+            "is wanted. The session identifier becomes free for reuse "
+            "afterwards and the session itself refuses all further calls. "
+            "Blocks up to 60 seconds waiting for the transfer to stop, then "
+            "returns the session's final status."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1667,17 +2310,26 @@ def register_logging_tools(server: MCPServer) -> None:
         name="logs_read",
         title="Read the execution log",
         description=(
-            "Read entries from the execution log that MSHCore writes for every "
-            "significant operation. Each entry carries a timestamp, severity, "
-            "component, action, message, and a details object. The three value "
-            "filters are exact-match and combine, so level='ERROR' with "
-            "component='download_manager' returns only failed downloads. "
-            "line_count then caps how many of those matches come back, keeping "
-            "the most recent ones — the log is appended in chronological order, "
-            "so a cap reads the newest end of it; entries are returned oldest "
-            "first either way. Call logs_get_file_info first to see how many "
-            "entries the log holds before reading it uncapped. Returns an empty "
-            "list when the log file does not exist yet."
+            "Read entries from this project's execution log, which MSHCore "
+            "writes for every significant operation. PRIMARY diagnostic tool "
+            "after any failure: a tool's error message is often shorter than "
+            "the log entry behind it. This is MSHCore's own log; "
+            "read_ollama_logs serves Ollama's separate log files, which are "
+            "where an Ollama service, model-load or GPU-detection failure is "
+            "explained. No prerequisites, though logs_get_file_info first "
+            "tells you how large the log is. Read-only. Returns a list of "
+            "entries, each with 'timestamp', 'level', 'component', 'action', "
+            "'message' and a 'details' object. The level, component and "
+            "action filters are exact-match, case-sensitive and combine as "
+            "AND, so level='ERROR' with component='download_manager' returns "
+            "only failed downloads; 'ERROR' matches and 'error' does not. "
+            "PAGINATE with line_count, which caps how many matching entries "
+            "come back and keeps the newest ones, since the log is appended "
+            "chronologically — pass it whenever the log is large, because an "
+            "uncapped read returns every match and will overflow the context. "
+            "Entries are always returned oldest first, capped or not. "
+            "line_count must be 1 or greater. Returns an empty list when "
+            "nothing matches or the log does not exist yet."
         ),
         annotations=READ_ONLY,
     )
@@ -1712,12 +2364,18 @@ def register_logging_tools(server: MCPServer) -> None:
         name="logs_get_file_info",
         title="Get the execution log's path and size",
         description=(
-            "Describe the execution log file without reading it: its absolute "
-            "path, how many entries it holds, and its size in bytes. Use the "
-            "entry count to decide whether to pass line_count to logs_read, "
-            "and the path to read or archive the raw log outside these tools. "
-            "A log that has never been written to reports zero lines and zero "
-            "bytes rather than failing."
+            "Describe the execution log without reading any of it. Call it "
+            "before logs_read to size the request: the entry count is what "
+            "tells you whether an uncapped read is safe or line_count is "
+            "required to avoid overflowing the context. Read-only in effect, "
+            "though it does create the log's parent directory if absent. "
+            "Returns one dict with exactly 'path' (the log's absolute path, "
+            "for reading or archiving the raw file outside these tools), "
+            "'line_count' (physical lines, which can slightly exceed the "
+            "number of entries logs_read yields because unparseable lines are "
+            "counted here and skipped there) and 'size_bytes'. A log that has "
+            "never been written reports zero for both counts rather than "
+            "failing. Fixed-size response; no pagination."
         ),
         annotations=READ_ONLY,
     )
