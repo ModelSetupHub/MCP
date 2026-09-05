@@ -33,9 +33,9 @@ from typing import Any
 # back from it would come from different copies, and `except
 # OperationCancelled` would silently miss the cancellation.
 from MSHCore import logging as core_logging
+from MSHCore.benchmark import ollama_runner
 from MSHCore.cancellation import CancellationToken, OperationCancelled
 from MSHCore.download_manager.manager import DownloadManager
-from MSHCore.ollama import experiment
 
 from .jobs import (
     CANCELLED,
@@ -77,7 +77,9 @@ DOWNLOAD_STEP_STATES = {
     "cancelled": CANCELLED,
 }
 
-BENCHMARK_COMPONENT = "ollama/experiment"
+# The component name MSHCore's benchmark runner writes its per-prompt entries
+# under, mirrored here so the log tail can pick them out.
+BENCHMARK_COMPONENT = "benchmark/ollama_runner"
 
 
 def _spawn(job: Job, target: Callable[[], None], name: str) -> None:
@@ -408,19 +410,21 @@ def start_benchmark(
     prompts: list[str],
     configurations: list[dict],
     include_output: bool,
+    repetitions: int = 1,
 ) -> Job:
-    """Begin a benchmark or comparison and run it on a worker thread.
+    """Begin a benchmark or configuration comparison and run it on a worker thread.
 
     One entry point for both shapes. A single test is one configuration with one
     row per prompt; a comparison is several, with one row per configuration. Both
-    call ``experiment.compare_tests``, so MSHCore does the normalisation either way
-    and this layer has one result shape to classify.
+    call ``ollama_runner.compare_tests``, so MSHCore does the normalisation either
+    way and this layer has one result shape to classify.
 
     Args:
         model: Model name or tag to benchmark.
         prompts: Prompts to run against every configuration.
         configurations: Normalised configurations, each ``{"name", "options"}``.
         include_output: Whether to include generated text in the results.
+        repetitions: How many times every prompt runs per configuration, from 1.
 
     Returns:
         Job: The job, already persisted, whose id the panel polls.
@@ -454,16 +458,84 @@ def start_benchmark(
     token = CancellationToken()
     job.set_cancel(token.cancel)
 
+    def run(cancellation: CancellationToken) -> dict:
+        return ollama_runner.compare_tests(
+            model=model,
+            prompts=prompts,
+            configurations=configurations,
+            include_output=include_output,
+            cancellation=cancellation,
+            repetitions=repetitions,
+        )
+
     _spawn(
         job,
         lambda: _run_benchmark(
             job=job,
             token=token,
-            model=model,
-            prompts=prompts,
-            configurations=configurations,
-            include_output=include_output,
+            names=[configuration["name"] for configuration in configurations],
+            prompt_count=len(prompts),
             single=single,
+            run=run,
+        ),
+        name="benchmark",
+    )
+
+    return job
+
+
+def start_model_comparison(
+    models: list[str],
+    prompts: list[str],
+    config: dict | None,
+    include_output: bool,
+    repetitions: int = 1,
+) -> Job:
+    """Begin a cross-model comparison and run it on a worker thread.
+
+    Calls ``ollama_runner.compare_models``: one shared configuration, the same
+    prompts, and one row per model — MSHCore unloads each model before the
+    next loads, so timings never compete for VRAM.
+
+    Args:
+        models: Model names or tags, in run order.
+        prompts: Prompts every model answers.
+        config: Generation options shared by every model, or None.
+        include_output: Whether to include generated text in the results.
+        repetitions: How many times every prompt runs per model, from 1.
+
+    Returns:
+        Job: The job, already persisted, whose id the panel polls.
+    """
+    job = Job(
+        kind="benchmark",
+        title=f"Comparing {len(models)} model(s)",
+        message=f"{', '.join(models)} · {len(prompts)} prompt(s) each",
+    )
+    job.add_steps(models, weight=float(len(prompts) or 1))
+
+    token = CancellationToken()
+    job.set_cancel(token.cancel)
+
+    def run(cancellation: CancellationToken) -> dict:
+        return ollama_runner.compare_models(
+            models=models,
+            prompts=prompts,
+            config=config,
+            include_output=include_output,
+            cancellation=cancellation,
+            repetitions=repetitions,
+        )
+
+    _spawn(
+        job,
+        lambda: _run_benchmark(
+            job=job,
+            token=token,
+            names=list(models),
+            prompt_count=len(prompts),
+            single=False,
+            run=run,
         ),
         name="benchmark",
     )
@@ -474,30 +546,30 @@ def start_benchmark(
 def _run_benchmark(
     job: Job,
     token: CancellationToken,
-    model: str,
-    prompts: list[str],
-    configurations: list[dict],
-    include_output: bool,
+    names: list[str],
+    prompt_count: int,
     single: bool,
+    run: Callable[[CancellationToken], dict],
 ) -> None:
     """Run one benchmark to a terminal status.
 
     Args:
         job: Job to keep current.
         token: Cancellation token the panel's Cancel button sets.
-        model: Model being benchmarked.
-        prompts: Prompts to run.
-        configurations: Configurations to run them against.
-        include_output: Whether to keep generated text.
-        single: Whether the rows are prompts rather than configurations.
+        names: Row names in run order — configuration or model names for a
+            comparison, which the log tail matches entries against.
+        prompt_count: Prompts every row runs.
+        single: Whether the rows are prompts rather than tests.
+        run: Runs the MSHCore comparison with the given cancellation token and
+            returns its result. Called on this worker thread.
     """
     stop = threading.Event()
     reader = threading.Thread(
         target=lambda: _tail_benchmark(
             job=job,
             stop=stop,
-            names=[configuration["name"] for configuration in configurations],
-            prompt_count=len(prompts),
+            names=names,
+            prompt_count=prompt_count,
             single=single,
         ),
         name="benchmark-log",
@@ -508,13 +580,7 @@ def _run_benchmark(
         job.begin()
         reader.start()
 
-        result = experiment.compare_tests(
-            model=model,
-            prompts=prompts,
-            configurations=configurations,
-            include_output=include_output,
-            cancellation=token,
-        )
+        result = run(token)
     except OperationCancelled as error:
         _stop_reader(stop, reader)
         job.finish(CANCELLED, message=str(error))
@@ -542,30 +608,36 @@ def _run_benchmark(
     # The measurements are the point of the benchmark, so they are stored with the
     # job rather than discarded. The model fetches them once the status is
     # completed; they are deliberately not repeated in every progress snapshot.
+    # The comparison shape is what the benchmark history expects, so it is stored
+    # whole and a single-test run is unwrapped only when it is read back.
     job.finish(
         COMPLETED,
         message="Finished. Retrieve the measurements with benchmark_get_result.",
-        result=_business_result(result, single=single),
+        result=result,
     )
 
 
-def _business_result(result: dict, single: bool) -> dict:
-    """Shape MSHCore's return value as the benchmark's deliverable.
+def _business_result(result: dict) -> dict:
+    """Shape a stored comparison result as the benchmark's deliverable.
 
-    A single test is one configuration, so its result is unwrapped to the shape
-    ``ollama_run_test`` returns. A comparison keeps MSHCore's own shape.
+    A single test is one configuration or one model, so its result is unwrapped
+    to the shape ``ollama_run_test`` returns. A comparison keeps MSHCore's own
+    shape. Applied when the result is fetched rather than when it is stored:
+    the benchmark history keeps every comparison whole.
 
     Args:
-        result: Return value of ``experiment.compare_tests``.
-        single: Whether this was a single test rather than a comparison.
+        result: Return value of ``ollama_runner.compare_tests`` or
+            ``ollama_runner.compare_models``.
 
     Returns:
         dict: The measurements the model reads.
     """
     tests = result.get("tests") or []
 
-    if single and tests:
-        return {"model": result.get("model"), **tests[0]}
+    if len(tests) == 1:
+        model = result.get("model") or (result.get("models") or [None])[0]
+
+        return {"model": model, **tests[0]}
 
     return result
 
@@ -593,7 +665,7 @@ def _benchmark_error(result: dict) -> str | None:
     and the failed rows carry their own errors.
 
     Args:
-        result: Return value of ``experiment.compare_tests``.
+        result: Return value of ``ollama_runner.compare_tests``.
 
     Returns:
         str | None: The first error found, or None when the run succeeded.
@@ -624,7 +696,7 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
 
     Args:
         job: Job whose rows are being closed.
-        result: Return value of ``experiment.compare_tests``.
+        result: Return value of ``ollama_runner.compare_tests``.
         single: Whether the rows are prompts rather than configurations.
     """
     tests = result.get("tests") or []

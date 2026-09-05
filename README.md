@@ -27,7 +27,7 @@ library, so they can be used interchangeably on the same machine.
 
 ## What the agent can do
 
-59 tools in total. Almost all of them are direct pass-throughs to the toolkit, so the agent gets the same capabilities a
+65 tools in total. Almost all of them are direct pass-throughs to the toolkit, so the agent gets the same capabilities a
 script would, grouped by area:
 
 - **System** — scan the machine, or read just the memory, storage, GPU or CUDA details.
@@ -35,8 +35,10 @@ script would, grouped by area:
   Ollama's own log files when something failed and the reason is buried in them.
 - **Models** — list what is installed and what is loaded, inspect a model, run a prompt, preload and unload, register a
   local GGUF file, create a configured copy of a model, and delete one.
-- **Benchmarking** — run a set of prompts under one configuration, or compare several configurations over the same
-  prompts.
+- **Benchmarking** — run a set of prompts under one configuration, or compare several configurations or several models
+  over the same prompts, with per-prompt timing-to-first-token, VRAM and GPU readings, repetition averaging with
+  run-to-run noise stats, a significance verdict on every comparison, and a saved history of past runs to browse, re-read
+  or delete.
 - **Python** — create and remove virtual environments, install, uninstall and list packages, write, read, edit, delete
   and run scripts, and install Python itself from an official installer.
 - **Downloads** — fetch a single file in one call, or build a queue, start it, watch its progress, pause, resume, skip a

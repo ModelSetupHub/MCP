@@ -12,8 +12,12 @@ Lifecycle
 Nothing else is a status. A slow poll, a reopened conversation or a missing record
 are conditions on the reader's side, and none of them is a state a job can be in.
 
-Every change persists the whole snapshot through :mod:`gui.store`, which is the
-source of truth. The registry below is a runtime cache: it exists so a Cancel
+Every change persists the whole snapshot to disk — under
+``%LOCALAPPDATA%\\MSH\\progress``, a folder that holds progress information
+only — which is the source of truth. A benchmark's measurements are kept
+apart, in the benchmark history (``MSHCore.benchmark.history``, under
+``benchmarks\\``), with the snapshot carrying only that entry's identifier.
+The registry below is a runtime cache: it exists so a Cancel
 button has an object to call, and so a reader mid-operation does not have to wait
 for the next throttled write. A job writes its final snapshot *before* leaving the
 registry, so there is no instant at which neither holds it.
@@ -26,12 +30,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, Callable
 import uuid
 
-from . import store
+from MSHCore.benchmark import history
+from MSHCore.paths import app_data_directory
 
 STARTING = "starting"
 RUNNING = "running"
@@ -48,6 +56,195 @@ SKIPPED = "skipped"
 # Shortest gap between two writes for a running job. Progress arrives several
 # times a second; the record is only read when someone polls.
 WRITE_INTERVAL = 0.5
+
+
+# ============================================================
+# Persistence — snapshots on disk, results in the history
+# ============================================================
+
+# Age at which a snapshot is dropped. Long enough that a conversation reopened
+# days later still shows what happened.
+MAX_AGE_SECONDS = 7 * 24 * 3600
+
+# Snapshots kept regardless of age, newest first, so a machine that runs a great
+# many operations does not accumulate files without bound. The measurements a
+# snapshot may point at are not pruned here: the benchmark history applies its
+# own cap in its own folder.
+MAX_RECORDS = 200
+
+
+def snapshots_directory() -> Path:
+    """Return the snapshots directory, creating it if needed.
+
+    Returns:
+        Path: ``%LOCALAPPDATA%\\MSH\\progress``, a folder that holds progress
+        information only.
+    """
+    path = app_data_directory() / "progress"
+    path.mkdir(parents=True, exist_ok=True)
+
+    return path
+
+
+def _safe(job_id: str) -> bool:
+    """Report whether an identifier is safe to use as a file name.
+
+    Identifiers are minted here and contain no path characters, but a value
+    arriving from a tool call is checked before it reaches the filesystem.
+
+    Args:
+        job_id: Identifier to check.
+
+    Returns:
+        bool: True when the identifier is a plain name.
+    """
+    return bool(job_id) and not ({"/", "\\", "."} & set(job_id))
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    """Write JSON to a path atomically.
+
+    Failures are swallowed: a progress record is not worth failing an operation
+    over, and the next write will try again.
+
+    Args:
+        path: Destination file.
+        payload: JSON-serialisable value.
+    """
+    try:
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def _read_json(path: Path) -> Any | None:
+    """Parse JSON from a path.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        Any | None: The parsed value, or None when it is missing or unreadable.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def save_snapshot(snapshot: dict[str, Any]) -> None:
+    """Write a snapshot as its job's record.
+
+    Args:
+        snapshot: Job snapshot carrying an ``id``.
+    """
+    job_id = snapshot.get("id")
+
+    if not job_id:
+        return
+
+    _write_json(snapshots_directory() / f"{job_id}.json", snapshot)
+
+
+def load_snapshot(job_id: str) -> dict[str, Any] | None:
+    """Read one job's snapshot.
+
+    Args:
+        job_id: Identifier of the run.
+
+    Returns:
+        dict[str, Any] | None: The snapshot, or None when there is no such
+        record.
+    """
+    if not _safe(job_id):
+        return None
+
+    record = _read_json(snapshots_directory() / f"{job_id}.json")
+
+    return record if isinstance(record, dict) else None
+
+
+def save_job_result(result: dict) -> str | None:
+    """Store a benchmark's measurements in the benchmark history.
+
+    The result is handed to the history store as MSHCore produced it — the
+    store validates it, indexes it and caps the folder. Failures are swallowed:
+    losing the measurements is better than a finished run failing to reach its
+    terminal status inside the store.
+
+    Args:
+        result: A comparison result carrying ``model`` and ``tests``, as
+            ``ollama_runner.compare_tests`` returned it.
+
+    Returns:
+        str | None: The identifier the history entry was stored under, or None
+        when it could not be stored.
+    """
+    try:
+        return history.save(result)
+    except Exception:
+        return None
+
+
+def load_job_result(job_id: str) -> Any | None:
+    """Read a job's business result from the benchmark history.
+
+    Args:
+        job_id: Identifier of the run.
+
+    Returns:
+        Any | None: The stored comparison result, or None when the run recorded
+        none or its history entry is gone — the history keeps its own
+        retention, so an entry can be pruned while the snapshot pointing at it
+        remains.
+    """
+    if not _safe(job_id):
+        return None
+
+    snapshot = load_snapshot(job_id)
+    benchmark_id = (
+        snapshot.get("benchmark_id") if isinstance(snapshot, dict) else None
+    )
+
+    if not benchmark_id:
+        return None
+
+    try:
+        record = history.load(benchmark_id)
+    except Exception:
+        return None
+
+    return record.get("result")
+
+
+def prune_snapshots() -> None:
+    """Drop snapshots that are too old, and the oldest once there are too many.
+
+    Called when a job finishes, which is the only moment the directory grows.
+    Only snapshots are pruned: a history entry a snapshot points at is kept or
+    dropped by the history's own cap, never from here.
+    """
+    try:
+        paths = sorted(
+            snapshots_directory().glob("*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+
+    cutoff = time.time() - MAX_AGE_SECONDS
+
+    for position, path in enumerate(paths):
+        try:
+            if position < MAX_RECORDS and path.stat().st_mtime >= cutoff:
+                continue
+
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 def new_job_id(kind: str) -> str:
@@ -182,6 +379,9 @@ class Job:
         # out of every snapshot — a comparison result is far larger than the
         # progress around it — and served by its own retrieval tool.
         self._result: Any | None = None
+        # The benchmark history entry holding that result, so the snapshot can
+        # point at the measurements without carrying them.
+        self._benchmark_id: str | None = None
 
         self._started_at = time.time()
         self._finished_at: float | None = None
@@ -377,7 +577,7 @@ class Job:
 
     def _write(self) -> None:
         """Persist the snapshot while the lock is held."""
-        store.save(self._snapshot())
+        save_snapshot(self._snapshot())
 
     # ========================================================
     # Finishing — the single terminal path
@@ -395,10 +595,11 @@ class Job:
         Idempotent: the first terminal status wins, so a watcher draining a late
         reading cannot overwrite a cancellation with "completed".
 
-        The order matters. The result is stored first, then the final snapshot —
-        which is what advertises the result — and only then is the job deregistered.
-        A reader therefore never sees ``result_available`` true with nothing to
-        fetch, nor loses the job between memory and disk.
+        The order matters. The result is stored in the benchmark history first,
+        its identifier recorded on the snapshot next — which is what advertises
+        the result — and only then is the job deregistered. A reader therefore
+        never sees ``result_available`` true with nothing to fetch, nor loses
+        the job between memory and disk.
 
         Args:
             status: ``completed``, ``failed`` or ``cancelled``.
@@ -437,20 +638,20 @@ class Job:
             self._resume = None
 
             if result is not None:
-                store.save_result(self.id, result)
+                self._benchmark_id = save_job_result(result)
 
             self._write()
 
         self._done.set()
         registry.remove(self.id)
-        store.prune()
+        prune_snapshots()
 
     def result(self) -> Any | None:
         """Return the operation's own return value.
 
-        Read from memory while the job is still registered and from its stored file
-        afterwards, so the same call works during the run — where it is None — and
-        long after.
+        Read from memory while the job is still registered and from the
+        benchmark history afterwards, so the same call works during the run —
+        where it is None — and long after.
 
         Returns:
             Any | None: The result, or None when the run produced none.
@@ -459,7 +660,7 @@ class Job:
             if self._result is not None:
                 return self._result
 
-        return store.load_result(self.id)
+        return load_job_result(self.id)
 
     def wait(self, timeout: float) -> bool:
         """Block until the job reaches a terminal status.
@@ -616,9 +817,11 @@ class Job:
             "message": self._message,
             "error": self._error,
             # Whether a business result is waiting to be fetched. A benchmark's
-            # measurements are not carried in the snapshot: the model retrieves
-            # them once, after this turns true.
+            # measurements are not carried in the snapshot — they live in the
+            # benchmark history under ``benchmarks\``, and the snapshot only
+            # records the entry's identifier.
             "result_available": self._result is not None,
+            "benchmark_id": self._benchmark_id,
             "steps": [step.as_dict() for step in self._steps],
             "metrics": [
                 {"label": metric.label, "value": metric.value}

@@ -5,8 +5,9 @@ Everything to do with the in-chat progress panel, kept out of ``main.py``:
 - ``assets/`` — the panel's HTML, CSS and JavaScript, one file each.
 - ``loader`` — inlines those assets into the single HTML document an MCP Apps
   ``ui://`` resource has to be.
-- ``jobs`` — the ``Job`` model and the registry of jobs running now.
-- ``store`` — the persisted snapshots, which are the source of truth.
+- ``jobs`` — the ``Job`` model, the registry of jobs running now, and the
+  persistence that keeps every job's snapshot on disk and its benchmark result
+  in the benchmark history.
 - ``workers`` — the threads that run the operations and keep their jobs current.
 - ``logtail`` — incremental reader for the execution log, used only by the
   benchmark worker.
@@ -35,12 +36,19 @@ from .app import (
     create_progress_app,
     register_progress_tools,
 )
-from .workers import note_download_ended, start_download
+from .workers import (
+    note_download_ended,
+    start_benchmark,
+    start_download,
+    start_model_comparison,
+)
 
 __all__ = [
     "PROGRESS_URI",
     "create_progress_app",
     "register_progress_tools",
     "note_download_ended",
+    "start_benchmark",
     "start_download",
+    "start_model_comparison",
 ]

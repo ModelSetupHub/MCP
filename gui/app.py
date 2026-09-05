@@ -46,8 +46,8 @@ from mcp.server.apps import Apps
 from mcp.server.mcpserver.exceptions import MCPServerError, ToolError
 from mcp.types import ToolAnnotations
 
-from . import store, workers
-from .jobs import Job, registry
+from . import workers
+from .jobs import Job, load_job_result, load_snapshot, registry
 from .loader import load_progress_app_html
 
 PROGRESS_URI = "ui://modelsetuphub/progress.html"
@@ -285,7 +285,7 @@ def _snapshot(progress_id: str) -> dict | None:
     """
     job = registry.get(progress_id)
 
-    return job.snapshot() if job is not None else store.load(progress_id)
+    return job.snapshot() if job is not None else load_snapshot(progress_id)
 
 
 def _not_found(progress_id: str | None) -> dict:
@@ -348,7 +348,7 @@ def read_result(progress_id: str) -> dict:
         return _not_found(progress_id)
 
     job = registry.get(progress_id)
-    result = job.result() if job is not None else store.load_result(progress_id)
+    result = job.result() if job is not None else load_job_result(progress_id)
 
     if result is None:
         return {
@@ -358,6 +358,10 @@ def read_result(progress_id: str) -> dict:
             "result_available": False,
             "message": _no_result_reason(snapshot),
         }
+
+    # The history stores every run as a comparison; a single test is unwrapped
+    # to the shape its synchronous tool returns, here rather than at write time.
+    result = workers._business_result(result)
 
     return {
         "id": progress_id,
@@ -569,7 +573,7 @@ def _inert(progress_id: str, field: str, value: Any) -> dict:
     Returns:
         dict: Snapshot or not-found response, with the outcome field set.
     """
-    record = store.load(progress_id)
+    record = load_snapshot(progress_id)
 
     if record is None:
         return {**_not_found(progress_id), field: value}
@@ -722,7 +726,11 @@ def _register_benchmarks(apps: Apps) -> None:
             "'failed' or 'cancelled', then call benchmark_get_result with the same "
             "id to obtain the measurements. "
             "The benchmark is not finished, and its results cannot be reported, "
-            "until that retrieval. Prefer this whenever a human is watching, since "
+            "until that retrieval. repetitions runs every prompt more than once "
+            "and reports the run-to-run spread with the means, which is also "
+            "what turns the comparison verdicts on; each repetition is a full "
+            "generation, so the run costs prompts x repetitions generations. "
+            "Prefer this whenever a human is watching, since "
             "each prompt is a full generation; use the synchronous ollama_run_test "
             "when the measurements are wanted in one call and no progress bar is "
             "needed."
@@ -736,6 +744,7 @@ def _register_benchmarks(apps: Apps) -> None:
         config: dict | None = None,
         name: str = "test",
         include_output: bool = False,
+        repetitions: int = 1,
     ) -> dict:
         """Start a benchmark of one configuration.
 
@@ -746,6 +755,7 @@ def _register_benchmarks(apps: Apps) -> None:
                 {"temperature": 0.7, "num_ctx": 4096}.
             name: Label recorded with the results.
             include_output: Whether to keep generated text alongside metrics.
+            repetitions: How many times every prompt runs, from 1.
 
         Returns:
             dict: The ``progress_id`` to poll, and the contract to follow.
@@ -755,6 +765,7 @@ def _register_benchmarks(apps: Apps) -> None:
             prompts=prompts,
             configurations=[{"name": name, "options": dict(config or {})}],
             include_output=include_output,
+            repetitions=repetitions,
         )
 
         return _benchmark_started(job, model=model_name, prompts=len(prompts))
@@ -775,8 +786,11 @@ def _register_benchmarks(apps: Apps) -> None:
             "benchmark_get_result with the same id to obtain the side-by-side "
             "measurements. The comparison is not "
             "finished, and no configuration can be recommended, until that "
-            "retrieval. Total time is the prompt count multiplied by the "
-            "configuration count, which is why this runs asynchronously; use the "
+            "retrieval. repetitions runs every prompt more than once per "
+            "configuration and reports the run-to-run spread, which is also "
+            "what turns the 'significance' verdict on. Total time is the prompt "
+            "count multiplied by the configuration count, which is why this "
+            "runs asynchronously; use the "
             "synchronous ollama_compare_tests when the measurements are wanted in "
             "one call."
         ),
@@ -788,6 +802,7 @@ def _register_benchmarks(apps: Apps) -> None:
         prompts: list[str],
         configurations: list[dict],
         include_output: bool = False,
+        repetitions: int = 1,
     ) -> dict:
         """Start a comparison across configurations.
 
@@ -797,6 +812,8 @@ def _register_benchmarks(apps: Apps) -> None:
             configurations: Configurations to compare, each shaped as
                 {"name": "warm", "options": {"temperature": 0.9}}.
             include_output: Whether to keep generated text alongside metrics.
+            repetitions: How many times every prompt runs per configuration,
+                from 1.
 
         Returns:
             dict: The ``progress_id`` to poll, and the contract to follow.
@@ -811,12 +828,81 @@ def _register_benchmarks(apps: Apps) -> None:
             prompts=prompts,
             configurations=_normalise(configurations),
             include_output=include_output,
+            repetitions=repetitions,
         )
 
         return _benchmark_started(
             job,
             model=model_name,
             configurations=len(configurations),
+        )
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        name="ollama_compare_models_with_progress",
+        title="Start comparing models, with a progress bar",
+        description=(
+            "Start a cross-model comparison: the same prompts and one shared "
+            "configuration run against several models, one after another, with "
+            "each model unloaded before the next loads so timings never compete "
+            "for VRAM. Shows a live progress bar with one row per model. Returns "
+            "immediately with a progress_id — an acknowledgement that the "
+            "comparison has started, NOT its results. Say that it has started, "
+            "end the turn and go to sleep; when the user calls again, poll "
+            "progress_get_status with that id until the status is 'completed', "
+            "'failed' or 'cancelled', then call benchmark_get_result with the "
+            "same id to obtain the side-by-side measurements and the "
+            "'significance' verdict on the two fastest models. Verify every "
+            "model with ollama_list_models first, and prefer the smallest "
+            "prompt list that can tell the models apart — total time is the "
+            "prompt count multiplied by the model count. There is no "
+            "synchronous variant; this is the only cross-model comparison tool."
+        ),
+        annotations=LONG_RUNNING,
+    )
+    @surface_core_errors
+    def ollama_compare_models_with_progress(
+        model_names: list[str],
+        prompts: list[str],
+        config: dict | None = None,
+        include_output: bool = False,
+        repetitions: int = 1,
+    ) -> dict:
+        """Start a comparison across models.
+
+        Args:
+            model_names: Model names or tags, in run order.
+            prompts: Prompts every model answers.
+            config: Optional generation options shared by every model.
+            include_output: Whether to keep generated text alongside metrics.
+            repetitions: How many times every prompt runs per model, from 1.
+
+        Returns:
+            dict: The ``progress_id`` to poll, and the contract to follow.
+
+        Raises:
+            ToolError: If fewer than two models were named. A comparison of one
+                model against itself is not a comparison; the worker would
+                surface the error only after this returned.
+        """
+        if len(model_names) < 2:
+            raise ToolError(
+                "At least two models are required for a comparison; to "
+                "benchmark one model use ollama_run_test_with_progress."
+            )
+
+        job = workers.start_model_comparison(
+            models=model_names,
+            prompts=prompts,
+            config=config,
+            include_output=include_output,
+            repetitions=repetitions,
+        )
+
+        return _benchmark_started(
+            job,
+            models=model_names,
+            prompts=len(prompts),
         )
 
 

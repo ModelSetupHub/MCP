@@ -50,6 +50,7 @@ except ImportError as error:
     ) from error
 
 from MSHCore import logging as core_logging  # noqa: E402
+from MSHCore.benchmark import history, ollama_runner  # noqa: E402
 from MSHCore.system import hardware, scanner  # noqa: E402
 from MSHCore.download_manager.manager import DownloadManager  # noqa: E402
 
@@ -64,7 +65,7 @@ DEFAULT_DOWNLOAD_DIRECTORY = str(DOWNLOADS_DIRECTORY)
 # validate against one list; it is read from there rather than through either of
 # them. `allowed_sources` renders it for a client, wildcard subdomains included.
 from MSHCore.download_manager.sources import allowed_sources  # noqa: E402
-from MSHCore.ollama import experiment, model, runtime  # noqa: E402
+from MSHCore.ollama import model, runtime  # noqa: E402
 from MSHCore.python import environment, installer, tools  # noqa: E402
 
 # The in-chat progress panel, the tools that draw it, and the plain tools that
@@ -96,13 +97,16 @@ restricted to a fixed domain whitelist.
   tens of seconds — do not call it for a single number. system_scan reports
   memory and storage in GiB; the narrow tools report raw bytes.
 - Generate text: ollama_run_model. Measure speed: ollama_run_test. Compare
-  parameter sets: ollama_compare_tests. Only ollama_configure_model creates a
+  parameter sets: ollama_compare_tests. Compare models against each other:
+  ollama_compare_models. Only ollama_configure_model creates a
   persistent model variant; the benchmark tools apply parameters per request
   and create nothing.
 - One file from the web: download_file, the primary download tool.
 - Several files as one unit of work: the session ceremony below.
-- Diagnose a failure: logs_read for anything MSHCore did, list_ollama_logs
-  then read_ollama_logs when Ollama itself is at fault.
+- Revisit a past benchmark: benchmark_list_history then
+  benchmark_get_saved_result. Diagnose a failure: logs_read for anything
+  MSHCore did, list_ollama_logs then read_ollama_logs when Ollama itself is
+  at fault.
 
 ## Single-call tools versus the download queue
 
@@ -118,7 +122,7 @@ several calls; nothing is transferred until the queue is started:
 Skipping the start leaves a queue that never runs. download_file performs all
 three steps itself, so never pair it with them.
 
-## Two kinds of identifier — never interchange them
+## Three kinds of identifier — never interchange them
 
 - session_id names a download queue. You choose it when calling
   download_create_session. Every download_* tool takes it, and only those
@@ -128,8 +132,12 @@ three steps itself, so never pair it with them.
   returns it; you never choose it. Only progress_get_status,
   benchmark_get_result, progress_cancel and progress_pause accept it. Format:
   'download-<date>-<time>-<8 hex>' or 'benchmark-<date>-<time>-<8 hex>'.
+- benchmark_id names one run kept in the benchmark history. benchmark_list_history
+  lists them; benchmark_get_saved_result and benchmark_delete_history take
+  one. Format: '<date>T<time>_<6 hex>'. A history id and a progress_id are
+  never interchangeable.
 
-download_file returns both, and its progress_id is under the key
+download_file returns the first two, and its progress_id is under the key
 'download_id'. Passing a session_id to progress_get_status reports
 found=false; passing a progress_id to a download_* tool reports an unknown
 session. Never call the starting tool again in order to obtain an id — the
@@ -140,19 +148,19 @@ first call already returned it, and a second call starts a second operation.
 Immediate: every read-only tool, and every download_* queue-control tool.
 
 Blocking until finished, with no progress reporting: ollama_run_model,
-ollama_run_test, ollama_compare_tests, ollama_start, ollama_stop,
-ollama_install, python_run_script, python_install_packages,
+ollama_run_test, ollama_compare_tests, ollama_compare_models, ollama_start,
+ollama_stop, ollama_install, python_run_script, python_install_packages,
 python_create_environment and python_install_python. None has a timeout,
 several take minutes, and installers have no progress variant at all.
 
 Background, returning a progress_id at once: download_file,
-download_start_with_progress, ollama_run_test_with_progress and
-ollama_compare_tests_with_progress. Track them with
-progress_get_status(progress_id), which is a fast, non-blocking read of a
-recorded snapshot: status is 'starting' or 'running' while work continues,
-then 'completed', 'failed' or 'cancelled'. It answers after the operation
-ends and after this server restarts. An unknown id reports found=false and
-is never answered with another operation's progress.
+download_start_with_progress, ollama_run_test_with_progress,
+ollama_compare_tests_with_progress and ollama_compare_models_with_progress.
+Track them with progress_get_status(progress_id), which is a fast,
+non-blocking read of a recorded snapshot: status is 'starting' or 'running'
+while work continues, then 'completed', 'failed' or 'cancelled'. It answers
+after the operation ends and after this server restarts. An unknown id
+reports found=false and is never answered with another operation's progress.
 
 Both kinds run without you, and benchmarks follow the same behaviour as
 downloads: after starting either one, say that it has started, then end the
@@ -169,13 +177,19 @@ The two kinds differ in what waking up means:
 - Benchmarks return an acknowledgement containing no measurements. On
   waking, call progress_get_status with the same id until the status is
   terminal, then call benchmark_get_result(progress_id) with it: that reads
-  the measurements back from the file the finished run stored on disk, and
-  it is the only place they exist. Until then, do not describe timings,
-  compare configurations or recommend settings — and a failed or cancelled
-  run produces no measurements and says so.
+  the measurements back from the benchmark history the finished run was
+  saved into, and it is the only place they exist. Until then, do not
+  describe timings, compare configurations or recommend settings — and a
+  failed or cancelled run produces no measurements and says so. The run
+  stays in the history afterwards: a completed snapshot carries its
+  'benchmark_id', and benchmark_list_history and benchmark_get_saved_result
+  reach it again in any later conversation. Every background comparison
+  also carries a 'significance' verdict — a real true/false when
+  repetitions ran above 1, null when each prompt was measured once.
 
-Use the synchronous ollama_run_test or ollama_compare_tests when you want the
-measurements from a single call and no progress bar.
+Use the synchronous ollama_run_test, ollama_compare_tests or
+ollama_compare_models when you want the measurements from a single call and
+no progress bar.
 
 ## Controlling a running operation
 
@@ -214,10 +228,11 @@ progress_id named in the error, or cancel it first.
   entry behind it. For an Ollama service, model-load or GPU-detection failure,
   call list_ollama_logs and then read_ollama_logs with a line range.
 
-Tools that delete models, environments, script files, packages, or downloaded
-files are irreversible and annotated destructive. Verify the target — with
-ollama_list_models, python_list_packages, python_read_script or
-download_get_status — before calling them.
+Tools that delete models, environments, script files, packages, downloaded
+files, or saved benchmark runs are irreversible and annotated destructive.
+Verify the target — with
+ollama_list_models, python_list_packages, python_read_script,
+download_get_status or benchmark_list_history — before calling them.
 """
 
 READ_ONLY = ToolAnnotations(
@@ -938,11 +953,11 @@ def register_ollama_model_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Benchmarking — MSHCore.ollama.experiment
+# Benchmarking — MSHCore.benchmark (runner and history)
 # ============================================================
 
-def register_ollama_experiment_tools(server: MCPServer) -> None:
-    """Register model benchmarking and comparison tools.
+def register_benchmark_tools(server: MCPServer) -> None:
+    """Register model benchmarking, comparison, and history tools.
 
     Args:
         server: Server instance the tools are attached to.
@@ -967,22 +982,40 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
             "the Ollama service to be running and model_name to be installed. "
             "config holds per-request generation options, so no model is "
             "created or modified — reach for ollama_configure_model only when "
-            "a persistent variant is wanted. Returns one dict with exactly "
-            "'name', 'model', 'configuration', 'results' (one entry per "
-            "prompt, in order) and 'summary'. A successful prompt entry "
-            "carries 'duration_seconds', 'prompt_tokens', 'output_tokens', "
-            "'prompt_tokens_per_second' and 'output_tokens_per_second'; a "
-            "rate of null means Ollama did not report it, not zero "
-            "throughput. 'summary' holds 'average_duration_seconds', the two "
-            "average rates and 'total_output_tokens', computed over "
-            "successful prompts only. The model is preloaded before each "
-            "prompt and that load time is excluded from every figure. A "
-            "prompt that fails is recorded with 'success': false and an "
-            "'error' instead of aborting the run. Leave include_output false "
-            "unless the generated text itself is needed: true adds every full "
+            "a persistent variant is wanted. repetitions runs every prompt "
+            "more than once and averages the runs: the first repetition "
+            "doubles as the warmup the following ones benefit from, and the "
+            "spread of the timing and rate metrics is reported alongside the "
+            "means, so set it above 1 whenever a conclusion has to survive "
+            "run-to-run noise. Returns one dict with exactly 'name', "
+            "'model', 'configuration', 'results' (one entry "
+            "per prompt, in order) and 'summary'. A successful prompt entry "
+            "carries 'repetitions' (how many runs were averaged), "
+            "'duration_seconds', 'prompt_tokens', 'output_tokens', "
+            "'prompt_tokens_per_second', 'output_tokens_per_second' and, "
+            "measured at the moment the generation finished: 'ttft_seconds' "
+            "(time to the first streamed token; null when nothing was "
+            "generated), 'vram_used_mb' (whole-GPU usage as the driver "
+            "reports it, every process included) and, when the machine has "
+            "an NVIDIA GPU, 'gpu_temperature_c' and 'gpu_clock_mhz' of the "
+            "hottest GPU — a falling clock beside a rising temperature is "
+            "the trace of a thermal throttle. The timing and rate metrics "
+            "among these also carry '_stddev', '_min' and '_max' variants, "
+            "and a prompt with some failed repetitions reports "
+            "'failed_repetitions'; a rate of null means Ollama did not "
+            "report it, not zero throughput. 'summary' "
+            "holds 'average_duration_seconds', the two average rates, "
+            "'total_output_tokens' and 'output_tokens_per_second_stddev' "
+            "(the pooled run-to-run noise level, null unless repetitions "
+            "were run), computed over successful prompts only. The model is "
+            "preloaded before each repetition and that load time is excluded "
+            "from every figure. A prompt that fails in every repetition is "
+            "recorded with 'success': false and an 'error' instead of "
+            "aborting the run. Leave include_output false unless the "
+            "generated text itself is needed: true adds every full "
             "completion to the response and can overflow the context. Blocks "
-            "for the sum of all generations with no timeout and no progress "
-            "reporting."
+            "for the sum of all generations — prompts times repetitions — "
+            "with no timeout and no progress reporting."
         ),
         annotations=benchmark,
     )
@@ -993,6 +1026,7 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
         config: dict | None = None,
         name: str = "test",
         include_output: bool = False,
+        repetitions: int = 1,
     ) -> dict:
         """Benchmark a model under a single configuration.
 
@@ -1003,16 +1037,18 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
                 {"temperature": 0.7, "num_ctx": 4096}.
             name: Label recorded with the results.
             include_output: Whether to include generated text alongside metrics.
+            repetitions: How many times every prompt is executed, from 1.
 
         Returns:
             dict: Per-prompt results and a summary of averaged metrics.
         """
-        return experiment.run_test(
+        return ollama_runner.run_test(
             model=model_name,
             prompts=prompts,
             config=config,
             name=name,
             include_output=include_output,
+            repetitions=repetitions,
         )
 
     @server.tool(
@@ -1029,14 +1065,25 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
             "configurations is a dict with 'name' (a label; defaults to "
             "'configuration_N') and 'options' (the generation parameters, "
             "defaulting to none). Parameters are applied per request; no "
-            "model is created or modified. Returns one dict with exactly "
-            "'model' and 'tests', where 'tests' holds one full "
-            "ollama_run_test result per configuration in the order given — "
-            "there is no combined summary and no winner, so compare the "
+            "model is created or modified. repetitions runs every prompt "
+            "more than once per configuration and reports the run-to-run "
+            "spread with the means; set it above 1 whenever the conclusion "
+            "has to survive noise. Returns one dict with exactly 'model', "
+            "'tests' and 'significance', where 'tests' holds one "
+            "full ollama_run_test result per configuration in the order "
+            "given, and 'significance' judges the two fastest "
+            "configurations: 'leader', 'runner_up', 'difference', "
+            "'noise_level', 'difference_to_noise_ratio', 'significant' and "
+            "a 'message' explaining the verdict. With repetitions above 1 "
+            "'significant' is a real true/false answer to whether the gap "
+            "exceeds the measured noise; at the default of 1 it is null "
+            "with a message saying so — a visible gap between single "
+            "measurements is not evidence. It is advisory; also read the "
             "per-configuration 'summary' values yourself. Total cost is the "
-            "prompt count multiplied by the configuration count, every one a "
-            "full generation, and it blocks for all of them with no timeout "
-            "and no progress reporting. Leave include_output false unless the "
+            "prompt count multiplied by the configuration count times "
+            "repetitions, every one a full generation, and it blocks for "
+            "all of them with no timeout and no progress reporting. Leave "
+            "include_output false unless the "
             "generated text is needed: true multiplies the response size by "
             "the configuration count and can overflow the context."
         ),
@@ -1048,6 +1095,7 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
         prompts: list[str],
         configurations: list[dict],
         include_output: bool = False,
+        repetitions: int = 1,
     ) -> dict:
         """Compare a model across multiple configurations.
 
@@ -1057,16 +1105,186 @@ def register_ollama_experiment_tools(server: MCPServer) -> None:
             configurations: Configurations to compare, each shaped as
                 {"name": "warm", "options": {"temperature": 0.9}}.
             include_output: Whether to include generated text alongside metrics.
+            repetitions: How many times every prompt runs per configuration,
+                from 1.
 
         Returns:
             dict: One benchmark result per configuration.
         """
-        return experiment.compare_tests(
+        return ollama_runner.compare_tests(
             model=model_name,
             prompts=prompts,
             configurations=configurations,
             include_output=include_output,
+            repetitions=repetitions,
         )
+
+    @server.tool(
+        name="ollama_compare_models",
+        title="Compare models",
+        description=(
+            "Benchmark several models over the same prompts under one "
+            "shared configuration, and return every model's measurements "
+            "side by side in this one call. Primary tool for choosing "
+            "between models when you want the numbers immediately; use "
+            "ollama_compare_models_with_progress when a human is watching — "
+            "that is the background variant of this tool, and the only "
+            "cross-model comparison with a progress bar. Requires the "
+            "Ollama service to be running and every name in model_names to "
+            "be installed; verify with ollama_list_models first. Models run "
+            "one after another — the model measured before is unloaded "
+            "before the next loads, so timings never compete for VRAM; a "
+            "model that was already loaded before the comparison began is "
+            "not the comparison's to stop and stays loaded. config is one "
+            "generation-options dict shared by every model, because a fair "
+            "comparison changes one thing at a time; several configurations "
+            "per model means ollama_compare_tests instead. repetitions runs "
+            "every prompt more than once per model and reports the "
+            "run-to-run spread with the means; set it above 1 whenever the "
+            "conclusion has to survive noise. Returns one dict with exactly "
+            "'models' (the names, in run order), 'tests' (one full "
+            "ollama_run_test result per model, its 'name' being the model's "
+            "own) and 'significance' judging the two fastest models — "
+            "'significant' is a real true/false verdict with repetitions "
+            "above 1 and null at the default of 1. Read the winner from "
+            "each test's 'summary'. Total cost is the prompt count "
+            "multiplied by the model count times repetitions, every one a "
+            "full generation, and it blocks for all of them with no timeout "
+            "and no progress reporting. Leave include_output false unless "
+            "the generated text is needed: true multiplies the response "
+            "size by the model count and can overflow the context."
+        ),
+        annotations=benchmark,
+    )
+    @surface_core_errors
+    def ollama_compare_models(
+        model_names: list[str],
+        prompts: list[str],
+        config: dict | None = None,
+        include_output: bool = False,
+        repetitions: int = 1,
+    ) -> dict:
+        """Compare several models over the same prompts.
+
+        Args:
+            model_names: Models to benchmark, in run order.
+            prompts: Prompts every model answers.
+            config: Optional generation options shared by every model.
+            include_output: Whether to include generated text alongside metrics.
+            repetitions: How many times every prompt runs per model, from 1.
+
+        Returns:
+            dict: One benchmark result per model and a significance
+                assessment.
+        """
+        return ollama_runner.compare_models(
+            models=model_names,
+            prompts=prompts,
+            config=config,
+            include_output=include_output,
+            repetitions=repetitions,
+        )
+
+    @server.tool(
+        name="benchmark_list_history",
+        title="List saved benchmark runs",
+        description=(
+            "List every benchmark run kept in the history, newest first. "
+            "Every completed background benchmark — ollama_run_test_with_progress, "
+            "ollama_compare_tests_with_progress, "
+            "ollama_compare_models_with_progress — is saved here "
+            "automatically, as is nothing else: the synchronous benchmark "
+            "tools return their measurements in the call and store nothing. "
+            "Read-only and cheap: the listing comes from a small index file, "
+            "not the results themselves. Call it to revisit a comparison "
+            "made earlier, to pick an id for benchmark_get_saved_result, or "
+            "to see whether a progress_id's run is already in the history. "
+            "Returns one record per run with 'id' (the benchmark_id; this — "
+            "not a progress_id — is what benchmark_get_saved_result and "
+            "benchmark_delete_history take), 'saved_at', 'model' or "
+            "'models', 'repetitions', "
+            "'configuration_count', 'prompt_count', 'winner' (the fastest "
+            "configuration or model's name) and 'significant'. The history "
+            "keeps the most recent runs only, so old ids disappear as new "
+            "runs arrive."
+        ),
+        annotations=READ_ONLY,
+    )
+    @surface_core_errors
+    def benchmark_list_history() -> list[dict]:
+        """List the saved benchmark runs, newest first.
+
+        Returns:
+            list[dict]: One record per saved run.
+        """
+        return history.list_saved()
+
+    @server.tool(
+        name="benchmark_get_saved_result",
+        title="Read a saved benchmark run",
+        description=(
+            "Read one benchmark run from the history in full, by the "
+            "benchmark_id benchmark_list_history reported. Returns the "
+            "header — 'id', "
+            "'saved_at', 'model' or 'models', 'prompts', 'configurations', "
+            "'repetitions', 'summary' with the winner and significance "
+            "verdict — plus the complete comparison result under 'result': "
+            "per-prompt timings, token counts, per-prompt ttft, VRAM and "
+            "GPU readings, the run-to-run spreads, and the 'significance' "
+            "assessment. This is the read tool for runs made in earlier "
+            "conversations or before this server restarted; for a run "
+            "started in this conversation you more likely want "
+            "benchmark_get_result with its progress_id instead, which also "
+            "works for runs still in flight. Read-only."
+        ),
+        annotations=READ_ONLY,
+    )
+    @surface_core_errors
+    def benchmark_get_saved_result(benchmark_id: str) -> dict:
+        """Read one saved benchmark run in full.
+
+        Args:
+            benchmark_id: Identifier from benchmark_list_history.
+
+        Returns:
+            dict: The stored record — header, summary and full result.
+        """
+        return history.load(benchmark_id)
+
+    @server.tool(
+        name="benchmark_delete_history",
+        title="Delete a saved benchmark run",
+        description=(
+            "Permanently remove one benchmark run from the history, by the "
+            "benchmark_id benchmark_list_history reported. DESTRUCTIVE and "
+            "IRREVERSIBLE: the result file and its index record are gone — "
+            "read the run with benchmark_get_saved_result first if its "
+            "measurements might still matter. The result files are a few "
+            "hundred kilobytes each and the history caps itself, so "
+            "deleting is for wiping a run whose numbers were wrong, not "
+            "for freeing space. Takes a benchmark_id, never a progress_id. "
+            "Returns true when a run was removed, false when nothing was "
+            "stored under that id — deleting a missing id is the state "
+            "asked for, not a failure."
+        ),
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=True,
+            idempotent_hint=True,
+            open_world_hint=False,
+        ),
+    )
+    @surface_core_errors
+    def benchmark_delete_history(benchmark_id: str) -> bool:
+        """Remove one saved benchmark run from the history.
+
+        Args:
+            benchmark_id: Identifier from benchmark_list_history.
+
+        Returns:
+            bool: True when a run was removed, False when there was none.
+        """
+        return history.delete(benchmark_id)
 
 
 # ============================================================
@@ -2416,7 +2634,7 @@ REGISTRARS = (
     register_system_tools,
     register_ollama_runtime_tools,
     register_ollama_model_tools,
-    register_ollama_experiment_tools,
+    register_benchmark_tools,
     register_python_tools,
     register_download_tools,
     register_logging_tools,
